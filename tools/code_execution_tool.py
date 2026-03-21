@@ -430,7 +430,8 @@ def execute_code(
         # generated scripts. The child accesses tools via RPC, not direct API.
         _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
                               "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
-                              "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA")
+                              "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA",
+                              "SUPABASE_URL", "SNOWFLAKE_", "HERMES_USER_ID")
         _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
                               "PASSWD", "AUTH")
         child_env = {}
@@ -441,6 +442,12 @@ def execute_code(
                 child_env[k] = v
         child_env["HERMES_RPC_SOCKET"] = sock_path
         child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+        # Supabase service role key is needed for the supabase-reader skill
+        # inside code execution. It's blocked by _SECRET_SUBSTRINGS so we
+        # inject it explicitly.
+        _supa_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+        if _supa_key:
+            child_env["SUPABASE_SERVICE_ROLE_KEY"] = _supa_key
         # Ensure the hermes-agent root is importable in the sandbox so
         # modules like minisweagent_path are available to child scripts.
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
