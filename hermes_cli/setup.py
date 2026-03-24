@@ -4,9 +4,9 @@ Interactive setup wizard for Hermes Agent.
 Modular wizard with independently-runnable sections:
   1. Model & Provider — choose your AI provider and model
   2. Terminal Backend — where your agent runs commands
-  3. Messaging Platforms — connect Telegram, Discord, etc.
-  4. Tools — configure TTS, web search, image generation, etc.
-  5. Agent Settings — iterations, compression, session reset
+  3. Agent Settings — iterations, compression, session reset
+  4. Messaging Platforms — connect Telegram, Discord, etc.
+  5. Tools — configure TTS, web search, image generation, etc.
 
 Config files are stored in ~/.hermes/ for easy access.
 """
@@ -873,9 +873,9 @@ def setup_model_provider(config: dict):
         keep_label = None  # No provider configured — don't show "Keep current"
 
     provider_choices = [
+        "OpenRouter API key (100+ models, pay-per-use)",
         "Login with Nous Portal (Nous Research subscription — OAuth)",
         "Login with OpenAI Codex",
-        "OpenRouter API key (100+ models, pay-per-use)",
         "Custom OpenAI-compatible endpoint (self-hosted / VLLM / etc.)",
         "Z.AI / GLM (Zhipu AI models)",
         "Kimi / Moonshot (Kimi coding models)",
@@ -894,7 +894,7 @@ def setup_model_provider(config: dict):
         provider_choices.append(keep_label)
 
     # Default to "Keep current" if a provider exists, otherwise OpenRouter (most common)
-    default_provider = len(provider_choices) - 1 if has_any_provider else 2
+    default_provider = len(provider_choices) - 1 if has_any_provider else 0
 
     if not has_any_provider:
         print_warning("An inference provider is required for Hermes to work.")
@@ -911,81 +911,7 @@ def setup_model_provider(config: dict):
     selected_base_url = None  # deferred until after model selection
     nous_models = []  # populated if Nous login succeeds
 
-    if provider_idx == 0:  # Nous Portal (OAuth)
-        selected_provider = "nous"
-        print()
-        print_header("Nous Portal Login")
-        print_info("This will open your browser to authenticate with Nous Portal.")
-        print_info("You'll need a Nous Research account with an active subscription.")
-        print()
-
-        try:
-            from hermes_cli.auth import _login_nous, ProviderConfig
-            import argparse
-
-            mock_args = argparse.Namespace(
-                portal_url=None,
-                inference_url=None,
-                client_id=None,
-                scope=None,
-                no_browser=False,
-                timeout=15.0,
-                ca_bundle=None,
-                insecure=False,
-            )
-            pconfig = PROVIDER_REGISTRY["nous"]
-            _login_nous(mock_args, pconfig)
-            _sync_model_from_disk(config)
-
-            # Fetch models for the selection step
-            try:
-                creds = resolve_nous_runtime_credentials(
-                    min_key_ttl_seconds=5 * 60,
-                    timeout_seconds=15.0,
-                )
-                nous_models = fetch_nous_models(
-                    inference_base_url=creds.get("base_url", ""),
-                    api_key=creds.get("api_key", ""),
-                )
-            except Exception as e:
-                logger.debug("Could not fetch Nous models after login: %s", e)
-
-        except SystemExit:
-            print_warning("Nous Portal login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-        except Exception as e:
-            print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-
-    elif provider_idx == 1:  # OpenAI Codex
-        selected_provider = "openai-codex"
-        print()
-        print_header("OpenAI Codex Login")
-        print()
-
-        try:
-            import argparse
-
-            mock_args = argparse.Namespace()
-            _login_openai_codex(mock_args, PROVIDER_REGISTRY["openai-codex"])
-            # Clear custom endpoint vars that would override provider routing.
-            if existing_custom:
-                save_env_value("OPENAI_BASE_URL", "")
-                save_env_value("OPENAI_API_KEY", "")
-            _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
-            _set_model_provider(config, "openai-codex", DEFAULT_CODEX_BASE_URL)
-        except SystemExit:
-            print_warning("OpenAI Codex login was cancelled or failed.")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-        except Exception as e:
-            print_error(f"Login failed: {e}")
-            print_info("You can try again later with: hermes model")
-            selected_provider = None
-
-    elif provider_idx == 2:  # OpenRouter
+    if provider_idx == 0:  # OpenRouter
         selected_provider = "openrouter"
         print()
         print_header("OpenRouter API Key")
@@ -1039,6 +965,80 @@ def setup_model_provider(config: dict):
             _set_model_provider(config, "openrouter")
         except Exception as e:
             logger.debug("Could not save provider to config.yaml: %s", e)
+
+    elif provider_idx == 1:  # Nous Portal (OAuth)
+        selected_provider = "nous"
+        print()
+        print_header("Nous Portal Login")
+        print_info("This will open your browser to authenticate with Nous Portal.")
+        print_info("You'll need a Nous Research account with an active subscription.")
+        print()
+
+        try:
+            from hermes_cli.auth import _login_nous, ProviderConfig
+            import argparse
+
+            mock_args = argparse.Namespace(
+                portal_url=None,
+                inference_url=None,
+                client_id=None,
+                scope=None,
+                no_browser=False,
+                timeout=15.0,
+                ca_bundle=None,
+                insecure=False,
+            )
+            pconfig = PROVIDER_REGISTRY["nous"]
+            _login_nous(mock_args, pconfig)
+            _sync_model_from_disk(config)
+
+            # Fetch models for the selection step
+            try:
+                creds = resolve_nous_runtime_credentials(
+                    min_key_ttl_seconds=5 * 60,
+                    timeout_seconds=15.0,
+                )
+                nous_models = fetch_nous_models(
+                    inference_base_url=creds.get("base_url", ""),
+                    api_key=creds.get("api_key", ""),
+                )
+            except Exception as e:
+                logger.debug("Could not fetch Nous models after login: %s", e)
+
+        except SystemExit:
+            print_warning("Nous Portal login was cancelled or failed.")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+        except Exception as e:
+            print_error(f"Login failed: {e}")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+
+    elif provider_idx == 2:  # OpenAI Codex
+        selected_provider = "openai-codex"
+        print()
+        print_header("OpenAI Codex Login")
+        print()
+
+        try:
+            import argparse
+
+            mock_args = argparse.Namespace()
+            _login_openai_codex(mock_args, PROVIDER_REGISTRY["openai-codex"])
+            # Clear custom endpoint vars that would override provider routing.
+            if existing_custom:
+                save_env_value("OPENAI_BASE_URL", "")
+                save_env_value("OPENAI_API_KEY", "")
+            _update_config_for_provider("openai-codex", DEFAULT_CODEX_BASE_URL)
+            _set_model_provider(config, "openai-codex", DEFAULT_CODEX_BASE_URL)
+        except SystemExit:
+            print_warning("OpenAI Codex login was cancelled or failed.")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
+        except Exception as e:
+            print_error(f"Login failed: {e}")
+            print_info("You can try again later with: hermes model")
+            selected_provider = None
 
     elif provider_idx == 3:  # Custom endpoint
         selected_provider = "custom"
@@ -1714,7 +1714,7 @@ def setup_model_provider(config: dict):
             model_cfg = _model_config_dict(config)
             model_cfg["api_mode"] = "chat_completions"
             config["model"] = model_cfg
-        elif selected_provider in ("copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "ai-gateway"):
+        elif selected_provider in ("copilot", "zai", "kimi-coding", "minimax", "minimax-cn", "kilocode", "ai-gateway", "opencode-zen", "opencode-go", "alibaba"):
             _setup_provider_model_selection(
                 config, selected_provider, current_model,
                 prompt_choice, prompt,
@@ -2037,7 +2037,7 @@ def setup_terminal_backend(config: dict):
 
         # Docker image
         current_image = config.get("terminal", {}).get(
-            "docker_image", "python:3.11-slim"
+            "docker_image", "nikolaik/python-nodejs:python3.11-nodejs20"
         )
         image = prompt("  Docker image", current_image)
         config["terminal"]["docker_image"] = image
@@ -2059,7 +2059,7 @@ def setup_terminal_backend(config: dict):
             print_info(f"Found: {sing_bin}")
 
         current_image = config.get("terminal", {}).get(
-            "singularity_image", "docker://python:3.11-slim"
+            "singularity_image", "docker://nikolaik/python-nodejs:python3.11-nodejs20"
         )
         image = prompt("  Container image", current_image)
         config["terminal"]["singularity_image"] = image
@@ -2261,7 +2261,7 @@ def setup_agent_settings(config: dict):
     )
     print_info("Maximum tool-calling iterations per conversation.")
     print_info("Higher = more complex tasks, but costs more tokens.")
-    print_info("Recommended: 30-60 for most tasks, 100+ for open exploration.")
+    print_info("Default is 90, which works for most tasks. Use 150+ for open exploration.")
 
     max_iter_str = prompt("Max iterations", current_max)
     try:
@@ -2303,7 +2303,7 @@ def setup_agent_settings(config: dict):
 
     config.setdefault("compression", {})["enabled"] = True
 
-    current_threshold = config.get("compression", {}).get("threshold", 0.85)
+    current_threshold = config.get("compression", {}).get("threshold", 0.50)
     threshold_str = prompt("Compression threshold (0.5-0.95)", str(current_threshold))
     try:
         threshold = float(threshold_str)
@@ -2313,7 +2313,7 @@ def setup_agent_settings(config: dict):
         pass
 
     print_success(
-        f"Context compression threshold set to {config['compression'].get('threshold', 0.85)}"
+        f"Context compression threshold set to {config['compression'].get('threshold', 0.50)}"
     )
 
     # ── Session Reset Policy ──
@@ -3248,9 +3248,9 @@ def run_setup_wizard(args):
         print_info("We'll walk you through:")
         print_info("  1. Model & Provider — choose your AI provider and model")
         print_info("  2. Terminal Backend — where your agent runs commands")
-        print_info("  3. Messaging Platforms — connect Telegram, Discord, etc.")
-        print_info("  4. Tools — configure TTS, web search, image generation, etc.")
-        print_info("  5. Agent Settings — iterations, compression, session reset")
+        print_info("  3. Agent Settings — iterations, compression, session reset")
+        print_info("  4. Messaging Platforms — connect Telegram, Discord, etc.")
+        print_info("  5. Tools — configure TTS, web search, image generation, etc.")
         print()
         print_info("Press Enter to begin, or Ctrl+C to exit.")
         try:

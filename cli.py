@@ -31,7 +31,6 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 # Suppress startup messages for clean CLI experience
-os.environ["MSWEA_SILENT_STARTUP"] = "1"  # mini-swe-agent
 os.environ["HERMES_QUIET"] = "1"  # Our own modules
 
 import yaml
@@ -78,8 +77,6 @@ _hermes_home = Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 _project_env = Path(__file__).parent / '.env'
 load_hermes_dotenv(hermes_home=_hermes_home, project_env=_project_env)
 
-# Point mini-swe-agent at ~/.hermes/ so it shares our config
-os.environ.setdefault("MSWEA_GLOBAL_CONFIG_DIR", str(_hermes_home))
 
 # =============================================================================
 # Configuration Loading
@@ -165,10 +162,10 @@ def load_cli_config() -> Dict[str, Any]:
             "cwd": ".",  # "." is resolved to os.getcwd() at runtime
             "timeout": 60,
             "lifetime_seconds": 300,
-            "docker_image": "python:3.11",
+            "docker_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "docker_forward_env": [],
-            "singularity_image": "docker://python:3.11",
-            "modal_image": "python:3.11",
+            "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
+            "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
             "docker_volumes": [],  # host:container volume mounts for Docker backend
             "docker_mount_cwd_to_workspace": False,  # explicit opt-in only; default off for sandbox isolation
@@ -180,7 +177,7 @@ def load_cli_config() -> Dict[str, Any]:
         "compression": {
             "enabled": True,      # Auto-compress when approaching context limit
             "threshold": 0.50,    # Compress at 50% of model's context limit
-            "summary_model": "google/gemini-3-flash-preview",  # Fast/cheap model for summaries
+            "summary_model": "",  # Model for summaries (empty = use main model)
         },
         "smart_model_routing": {
             "enabled": False,
@@ -216,7 +213,7 @@ def load_cli_config() -> Dict[str, Any]:
             "compact": False,
             "resume_display": "full",
             "show_reasoning": False,
-            "streaming": False,
+            "streaming": True,
 
             "skin": "default",
         },
@@ -301,7 +298,11 @@ def load_cli_config() -> Dict[str, Any]:
                 defaults["agent"]["max_turns"] = file_config["max_turns"]
         except Exception as e:
             logger.warning("Failed to load cli-config.yaml: %s", e)
-    
+
+    # Expand ${ENV_VAR} references in config values before bridging to env vars.
+    from hermes_cli.config import _expand_env_vars
+    defaults = _expand_env_vars(defaults)
+
     # Apply terminal config to environment variables (so terminal_tool picks them up)
     terminal_config = defaults.get("terminal", {})
     
@@ -398,7 +399,7 @@ def load_cli_config() -> Dict[str, Any]:
             "provider": "AUXILIARY_WEB_EXTRACT_PROVIDER",
             "model": "AUXILIARY_WEB_EXTRACT_MODEL",
             "base_url": "AUXILIARY_WEB_EXTRACT_BASE_URL",
-            "api_key": "AUXILI..._KEY",
+            "api_key": "AUXILIARY_WEB_EXTRACT_API_KEY",
         },
         "approval": {
             "provider": "AUXILIARY_APPROVAL_PROVIDER",
@@ -448,7 +449,6 @@ from rich import box as rich_box
 from rich.console import Console
 from rich.markup import escape as _escape
 from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text as _RichText
 
 import fire
@@ -460,12 +460,12 @@ from model_tools import get_tool_definitions, get_toolset_for_tool
 # Extracted CLI modules (Phase 3)
 from hermes_cli.banner import (
     cprint as _cprint, _GOLD, _BOLD, _DIM, _RST,
-    VERSION, RELEASE_DATE, HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
+    HERMES_AGENT_LOGO, HERMES_CADUCEUS, COMPACT_BANNER,
     build_welcome_banner,
 )
 from hermes_cli.commands import COMMANDS, SlashCommandCompleter, SlashCommandAutoSuggest
 from hermes_cli import callbacks as _callbacks
-from toolsets import get_all_toolsets, get_toolset_info, resolve_toolset, validate_toolset
+from toolsets import get_all_toolsets, get_toolset_info, validate_toolset
 
 # Cron job system for scheduled tasks (execution is handled by the gateway)
 from cron import get_job
@@ -497,6 +497,14 @@ def _run_cleanup():
     try:
         from tools.mcp_tool import shutdown_mcp_servers
         shutdown_mcp_servers()
+    except Exception:
+        pass
+    # Close cached auxiliary LLM clients (sync + async) so that
+    # AsyncHttpxClientWrapper.__del__ doesn't fire on a closed event loop
+    # and trigger prompt_toolkit's "Press ENTER to continue..." handler.
+    try:
+        from agent.auxiliary_client import shutdown_cached_clients
+        shutdown_cached_clients()
     except Exception:
         pass
 
@@ -884,13 +892,21 @@ def _build_compact_banner() -> str:
 
 from agent.skill_commands import (
     scan_skill_commands,
-    get_skill_commands,
     build_skill_invocation_message,
     build_plan_path,
     build_preloaded_skills_prompt,
 )
 
 _skill_commands = scan_skill_commands()
+
+
+def _get_plugin_cmd_handler_names() -> set:
+    """Return plugin command names (without slash prefix) for dispatch matching."""
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+        return set(get_plugin_manager()._plugin_commands.keys())
+    except Exception:
+        return set()
 
 
 def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> list[str]:
@@ -1473,8 +1489,14 @@ class HermesCLI:
         Opens a dim reasoning box on first token, streams line-by-line.
         The box is closed automatically when content tokens start arriving
         (via _stream_delta → _emit_stream_text).
+
+        Once the response box is open, suppress any further reasoning
+        rendering — a late thinking block (e.g. after an interrupt) would
+        otherwise draw a reasoning box inside the response box.
         """
         if not text:
+            return
+        if getattr(self, "_stream_box_opened", False):
             return
 
         # Open reasoning box on first reasoning token
@@ -1741,8 +1763,22 @@ class HermesCLI:
         resolved_acp_command = runtime.get("command")
         resolved_acp_args = list(runtime.get("args") or [])
         if not isinstance(api_key, str) or not api_key:
-            self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
-            return False
+            # Custom / local endpoints (llama.cpp, ollama, vLLM, etc.) often
+            # don't require authentication.  When a base_url IS configured but
+            # no API key was found, use a placeholder so the OpenAI SDK
+            # doesn't reject the request and local servers just ignore it.
+            _source = runtime.get("source", "")
+            _has_custom_base = isinstance(base_url, str) and base_url and "openrouter.ai" not in base_url
+            if _has_custom_base:
+                api_key = "no-key-required"
+                logger.debug(
+                    "No API key for custom endpoint %s (source=%s), "
+                    "using placeholder — local servers typically ignore auth",
+                    base_url, _source,
+                )
+            else:
+                self.console.print("[bold red]Provider resolver returned an empty API key.[/]")
+                return False
         if not isinstance(base_url, str) or not base_url:
             self.console.print("[bold red]Provider resolver returned an empty base URL.[/]")
             return False
@@ -1899,7 +1935,11 @@ class HermesCLI:
                 pass_session_id=self.pass_session_id,
                 tool_progress_callback=self._on_tool_progress,
                 stream_delta_callback=self._stream_delta if self.streaming_enabled else None,
+                tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
             )
+            # Route agent status output through prompt_toolkit so ANSI escape
+            # sequences aren't garbled by patch_stdout's StdoutProxy (#2262).
+            self.agent._print_fn = _cprint
             self._active_agent_route_signature = (
                 effective_model,
                 runtime.get("provider"),
@@ -1925,13 +1965,6 @@ class HermesCLI:
     def show_banner(self):
         """Display the welcome banner in Claude Code style."""
         self.console.clear()
-        if self.preloaded_skills and not self._startup_skills_line_shown:
-            skills_label = ", ".join(self.preloaded_skills)
-            self.console.print(
-                f"[bold {_accent_hex()}]Activated skills:[/] {skills_label}"
-            )
-            self.console.print()
-            self._startup_skills_line_shown = True
         
         # Auto-compact for narrow terminals — the full banner with caduceus
         # + tool list needs ~80 columns minimum to render without wrapping.
@@ -2310,10 +2343,9 @@ class HermesCLI:
         Inspired by OpenAI Codex's separation of interrupt (stop current turn)
         from /stop (clean up background processes). See openai/codex#14602.
         """
-        from tools.process_registry import get_registry
+        from tools.process_registry import process_registry
 
-        registry = get_registry()
-        processes = registry.list_processes()
+        processes = process_registry.list_sessions()
         running = [p for p in processes if p.get("status") == "running"]
 
         if not running:
@@ -2321,7 +2353,7 @@ class HermesCLI:
             return
 
         print(f"  Stopping {len(running)} background process(es)...")
-        killed = registry.kill_all()
+        killed = process_registry.kill_all()
         print(f"  ✅ Stopped {killed} process(es).")
 
     def _handle_paste_command(self):
@@ -3527,103 +3559,85 @@ class HermesCLI:
             # Use original case so model names like "Anthropic/Claude-Opus-4" are preserved
             parts = cmd_original.split(maxsplit=1)
             if len(parts) > 1:
-                from hermes_cli.auth import resolve_provider
-                from hermes_cli.models import (
-                    parse_model_input,
-                    validate_requested_model,
-                    _PROVIDER_LABELS,
-                )
+                from hermes_cli.model_switch import switch_model, switch_to_custom_provider
 
                 raw_input = parts[1].strip()
 
-                # Parse provider:model syntax (e.g. "openrouter:anthropic/claude-sonnet-4.5")
+                # Handle bare "/model custom" — switch to custom provider
+                # and auto-detect the model from the endpoint.
+                if raw_input.strip().lower() == "custom":
+                    result = switch_to_custom_provider()
+                    if result.success:
+                        self.model = result.model
+                        self.requested_provider = "custom"
+                        self.provider = "custom"
+                        self.api_key = result.api_key
+                        self.base_url = result.base_url
+                        self.agent = None
+                        save_config_value("model.default", result.model)
+                        save_config_value("model.provider", "custom")
+                        save_config_value("model.base_url", result.base_url)
+                        print(f"(^_^)b Model changed to: {result.model} [provider: Custom]")
+                        print(f"  Endpoint: {result.base_url}")
+                        print(f"  Status: connected (model auto-detected)")
+                    else:
+                        print(f"(>_<) {result.error_message}")
+                    return True
+
+                # Core model-switching pipeline (shared with gateway)
                 current_provider = self.provider or self.requested_provider or "openrouter"
-                target_provider, new_model = parse_model_input(raw_input, current_provider)
-                # Auto-detect provider when no explicit provider:model syntax was used.
-                # Skip auto-detection for custom providers — the model name might
-                # coincidentally match a known provider's catalog, but the user
-                # intends to use it on their custom endpoint.  Require explicit
-                # provider:model syntax (e.g. /model openai-codex:gpt-5.2-codex)
-                # to switch away from a custom endpoint.
-                _base = self.base_url or ""
-                is_custom = current_provider == "custom" or (
-                    "localhost" in _base or "127.0.0.1" in _base
+                result = switch_model(
+                    raw_input,
+                    current_provider,
+                    current_base_url=self.base_url or "",
+                    current_api_key=self.api_key or "",
                 )
-                if target_provider == current_provider and not is_custom:
-                    from hermes_cli.models import detect_provider_for_model
-                    detected = detect_provider_for_model(new_model, current_provider)
-                    if detected:
-                        target_provider, new_model = detected
-                provider_changed = target_provider != current_provider
 
-                # If provider is changing, re-resolve credentials for the new provider
-                api_key_for_probe = self.api_key
-                base_url_for_probe = self.base_url
-                if provider_changed:
-                    try:
-                        from hermes_cli.runtime_provider import resolve_runtime_provider
-                        runtime = resolve_runtime_provider(requested=target_provider)
-                        api_key_for_probe = runtime.get("api_key", "")
-                        base_url_for_probe = runtime.get("base_url", "")
-                    except Exception as e:
-                        provider_label = _PROVIDER_LABELS.get(target_provider, target_provider)
-                        if target_provider == "custom":
-                            print(f"(>_<) Custom endpoint not configured. Set OPENAI_BASE_URL and OPENAI_API_KEY,")
-                            print(f"      or run: hermes setup → Custom OpenAI-compatible endpoint")
-                        else:
-                            print(f"(>_<) Could not resolve credentials for provider '{provider_label}': {e}")
-                        print(f"(^_^) Current model unchanged: {self.model}")
-                        return True
-
-                try:
-                    validation = validate_requested_model(
-                        new_model,
-                        target_provider,
-                        api_key=api_key_for_probe,
-                        base_url=base_url_for_probe,
-                    )
-                except Exception:
-                    validation = {"accepted": True, "persist": True, "recognized": False, "message": None}
-
-                if not validation.get("accepted"):
-                    print(f"(>_<) {validation.get('message')}")
-                    print(f"  Model unchanged: {self.model}")
-                    if "Did you mean" not in (validation.get("message") or ""):
-                        print("  Tip: Use /model to see available models, /provider to see providers")
+                if not result.success:
+                    print(f"(>_<) {result.error_message}")
+                    if "Did you mean" not in result.error_message:
+                        print(f"  Model unchanged: {self.model}")
+                        if "credentials" not in result.error_message.lower():
+                            print("  Tip: Use /model to see available models, /provider to see providers")
                 else:
-                    self.model = new_model
+                    self.model = result.new_model
                     self.agent = None  # Force re-init
 
-                    if provider_changed:
-                        self.requested_provider = target_provider
-                        self.provider = target_provider
-                        self.api_key = api_key_for_probe
-                        self.base_url = base_url_for_probe
+                    if result.provider_changed:
+                        self.requested_provider = result.target_provider
+                        self.provider = result.target_provider
+                        self.api_key = result.api_key
+                        self.base_url = result.base_url
 
-                    provider_label = _PROVIDER_LABELS.get(target_provider, target_provider)
-                    provider_note = f" [provider: {provider_label}]" if provider_changed else ""
+                    provider_note = f" [provider: {result.provider_label}]" if result.provider_changed else ""
 
-                    if validation.get("persist"):
-                        saved_model = save_config_value("model.default", new_model)
-                        if provider_changed:
-                            save_config_value("model.provider", target_provider)
+                    if result.persist:
+                        saved_model = save_config_value("model.default", result.new_model)
+                        if result.provider_changed:
+                            save_config_value("model.provider", result.target_provider)
+                            # Persist base_url for custom endpoints; clear
+                            # when switching away from custom (#2562 Phase 2).
+                            if result.base_url and "openrouter.ai" not in (result.base_url or ""):
+                                save_config_value("model.base_url", result.base_url)
+                            else:
+                                save_config_value("model.base_url", None)
                         if saved_model:
-                            print(f"(^_^)b Model changed to: {new_model}{provider_note} (saved to config)")
+                            print(f"(^_^)b Model changed to: {result.new_model}{provider_note} (saved to config)")
                         else:
-                            print(f"(^_^) Model changed to: {new_model}{provider_note} (this session only)")
+                            print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
                     else:
-                        message = validation.get("message") or ""
-                        print(f"(^_^) Model changed to: {new_model}{provider_note} (this session only)")
-                        if message:
-                            print(f"  Reason: {message}")
+                        print(f"(^_^) Model changed to: {result.new_model}{provider_note} (this session only)")
+                        if result.warning_message:
+                            print(f"  Reason: {result.warning_message}")
                         print("  Note: Model will revert on restart. Use a verified model to save to config.")
 
-                    # Helpful hint when staying on a custom endpoint
-                    if is_custom and not provider_changed:
-                        endpoint = self.base_url or "custom endpoint"
+                    # Show endpoint info for custom providers
+                    if result.is_custom_target:
+                        endpoint = result.base_url or self.base_url or "custom endpoint"
                         print(f"  Endpoint: {endpoint}")
-                        print(f"  Tip: To switch providers, use /model provider:model")
-                        print(f"       e.g. /model openai-codex:gpt-5.2-codex")
+                        if not result.provider_changed:
+                            print(f"  Tip: To switch providers, use /model provider:model")
+                            print(f"       e.g. /model openai-codex:gpt-5.2-codex")
             else:
                 self._show_model_and_providers()
         elif canonical == "provider":
@@ -3753,6 +3767,18 @@ class HermesCLI:
                         self.console.print(f"[bold red]Quick command '{base_cmd}' has no target defined[/]")
                 else:
                     self.console.print(f"[bold red]Quick command '{base_cmd}' has unsupported type (supported: 'exec', 'alias')[/]")
+            # Check for plugin-registered slash commands
+            elif base_cmd.lstrip("/") in _get_plugin_cmd_handler_names():
+                from hermes_cli.plugins import get_plugin_command_handler
+                plugin_handler = get_plugin_command_handler(base_cmd.lstrip("/"))
+                if plugin_handler:
+                    user_args = cmd_original[len(base_cmd):].strip()
+                    try:
+                        result = plugin_handler(user_args)
+                        if result:
+                            _cprint(str(result))
+                    except Exception as e:
+                        _cprint(f"\033[1;31mPlugin command error: {e}{_RST}")
             # Check for skill slash commands (/gif-search, /axolotl, etc.)
             elif base_cmd in _skill_commands:
                 user_instruction = cmd_original[len(base_cmd):].strip()
@@ -4211,13 +4237,18 @@ class HermesCLI:
             elif not self.show_reasoning:
                 self.agent.reasoning_callback = None
 
+        # Use raw ANSI codes via _cprint so the output is routed through
+        # prompt_toolkit's renderer.  self.console.print() with Rich markup
+        # writes directly to stdout which patch_stdout's StdoutProxy mangles
+        # into garbled sequences like '?[33mTool progress: NEW?[0m' (#2262).
+        from hermes_cli.colors import Colors as _Colors
         labels = {
-            "off": "[dim]Tool progress: OFF[/] — silent mode, just the final response.",
-            "new": "[yellow]Tool progress: NEW[/] — show each new tool (skip repeats).",
-            "all": "[green]Tool progress: ALL[/] — show every tool call.",
-            "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, think blocks, and debug logs.",
+            "off": f"{_Colors.DIM}Tool progress: OFF{_Colors.RESET} — silent mode, just the final response.",
+            "new": f"{_Colors.YELLOW}Tool progress: NEW{_Colors.RESET} — show each new tool (skip repeats).",
+            "all": f"{_Colors.GREEN}Tool progress: ALL{_Colors.RESET} — show every tool call.",
+            "verbose": f"{_Colors.BOLD}{_Colors.GREEN}Tool progress: VERBOSE{_Colors.RESET} — full args, results, think blocks, and debug logs.",
         }
-        self.console.print(labels.get(self.tool_progress_mode, ""))
+        _cprint(labels.get(self.tool_progress_mode, ""))
 
     def _handle_reasoning_command(self, cmd: str):
         """Handle /reasoning — manage effort level and display toggle.
@@ -4410,7 +4441,7 @@ class HermesCLI:
                 logging.getLogger(noisy).setLevel(logging.WARNING)
         else:
             logging.getLogger().setLevel(logging.INFO)
-            for quiet_logger in ('tools', 'minisweagent', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
+            for quiet_logger in ('tools', 'run_agent', 'trajectory_compressor', 'cron', 'hermes_cli'):
                 logging.getLogger(quiet_logger).setLevel(logging.ERROR)
 
     def _show_insights(self, command: str = "/insights"):
@@ -4581,6 +4612,26 @@ class HermesCLI:
 
         except Exception as e:
             print(f"  ❌ MCP reload failed: {e}")
+
+    # ====================================================================
+    # Tool-call generation indicator (shown during streaming)
+    # ====================================================================
+
+    def _on_tool_gen_start(self, tool_name: str) -> None:
+        """Called when the model begins generating tool-call arguments.
+
+        Closes any open streaming boxes (reasoning / response) exactly once,
+        then prints a short status line so the user sees activity instead of
+        a frozen screen while a large payload (e.g. 45 KB write_file) streams.
+        """
+        if getattr(self, "_stream_box_opened", False):
+            self._flush_stream()
+            self._stream_box_opened = False
+        self._close_reasoning_box()
+
+        from agent.display import get_tool_emoji
+        emoji = get_tool_emoji(tool_name, default="⚡")
+        _cprint(f"  ┊ {emoji} preparing {tool_name}…")
 
     # ====================================================================
     # Tool progress callback (audio cues for voice mode)
@@ -5346,6 +5397,28 @@ class HermesCLI:
                 message if isinstance(message, str) else "", images
             )
 
+        # Expand @ context references (e.g. @file:main.py, @diff, @folder:src/)
+        if isinstance(message, str) and "@" in message:
+            try:
+                from agent.context_references import preprocess_context_references
+                from agent.model_metadata import get_model_context_length
+                _ctx_len = get_model_context_length(
+                    self.model, base_url=self.base_url or "", api_key=self.api_key or "")
+                _ctx_result = preprocess_context_references(
+                    message, cwd=os.getcwd(), context_length=_ctx_len)
+                if _ctx_result.expanded or _ctx_result.blocked:
+                    if _ctx_result.references:
+                        _cprint(
+                            f"  {_DIM}[@ context: {len(_ctx_result.references)} ref(s), "
+                            f"{_ctx_result.injected_tokens} tokens]{_RST}")
+                    for w in _ctx_result.warnings:
+                        _cprint(f"  {_DIM}⚠ {w}{_RST}")
+                    if _ctx_result.blocked:
+                        return "\n".join(_ctx_result.warnings) or "Context injection refused."
+                    message = _ctx_result.message
+            except Exception as e:
+                logging.debug("@ context reference expansion failed: %s", e)
+
         # Add user message to history
         self.conversation_history.append({"role": "user", "content": message})
 
@@ -5773,16 +5846,85 @@ class HermesCLI:
         self._invalidate(min_interval=0.0)
         return True
 
+    # --- Protected TUI extension hooks for wrapper CLIs ---
+
+    def _get_extra_tui_widgets(self) -> list:
+        """Return extra prompt_toolkit widgets to insert into the TUI layout.
+
+        Wrapper CLIs can override this to inject widgets (e.g. a mini-player,
+        overlay menu) into the layout without overriding ``run()``.  Widgets
+        are inserted between the spacer and the status bar.
+        """
+        return []
+
+    def _register_extra_tui_keybindings(self, kb, *, input_area) -> None:
+        """Register extra keybindings on the TUI ``KeyBindings`` object.
+
+        Wrapper CLIs can override this to add keybindings (e.g. transport
+        controls, modal shortcuts) without overriding ``run()``.
+
+        Parameters
+        ----------
+        kb : KeyBindings
+            The active keybinding registry for the prompt_toolkit application.
+        input_area : TextArea
+            The main input widget, for wrappers that need to inspect or
+            manipulate user input from a keybinding handler.
+        """
+
+    def _build_tui_layout_children(
+        self,
+        *,
+        sudo_widget,
+        secret_widget,
+        approval_widget,
+        clarify_widget,
+        spinner_widget,
+        spacer,
+        status_bar,
+        input_rule_top,
+        image_bar,
+        input_area,
+        input_rule_bot,
+        voice_status_bar,
+        completions_menu,
+    ) -> list:
+        """Assemble the ordered list of children for the root ``HSplit``.
+
+        Wrapper CLIs typically override ``_get_extra_tui_widgets`` instead of
+        this method.  Override this only when you need full control over widget
+        ordering.
+        """
+        return [
+            Window(height=0),
+            sudo_widget,
+            secret_widget,
+            approval_widget,
+            clarify_widget,
+            spinner_widget,
+            spacer,
+            *self._get_extra_tui_widgets(),
+            status_bar,
+            input_rule_top,
+            image_bar,
+            input_area,
+            input_rule_bot,
+            voice_status_bar,
+            completions_menu,
+        ]
+
     def run(self):
         """Run the interactive CLI loop with persistent input at bottom."""
         self.show_banner()
 
-        # One-line Honcho session indicator (TTY-only, not captured by agent)
+        # One-line Honcho session indicator (TTY-only, not captured by agent).
+        # Only show when the user explicitly configured Honcho for Hermes
+        # (not auto-enabled from a stray HONCHO_API_KEY env var).
         try:
             from honcho_integration.client import HonchoClientConfig
             from agent.display import honcho_session_line, write_tty
             hcfg = HonchoClientConfig.from_global_config()
-            if hcfg.enabled and hcfg.api_key:
+            if hcfg.enabled and hcfg.api_key and hcfg.explicitly_configured:
                 sname = hcfg.resolve_session_name(session_id=self.session_id)
                 if sname:
                     write_tty(honcho_session_line(hcfg.workspace_id, sname) + "\n")
@@ -5804,6 +5946,12 @@ class HermesCLI:
             _welcome_text = "Welcome to Hermes Agent! Type your message or /help for commands."
             _welcome_color = "#FFF8DC"
         self.console.print(f"[{_welcome_color}]{_welcome_text}[/]")
+        if self.preloaded_skills and not self._startup_skills_line_shown:
+            skills_label = ", ".join(self.preloaded_skills)
+            self.console.print(
+                f"[bold {_accent_hex()}]Activated skills:[/] {skills_label}"
+            )
+            self._startup_skills_line_shown = True
         self.console.print()
         
         # State for async operation
@@ -6735,26 +6883,32 @@ class HermesCLI:
             filter=Condition(lambda: cli_ref._status_bar_visible),
         )
 
+        # Allow wrapper CLIs to register extra keybindings.
+        self._register_extra_tui_keybindings(kb, input_area=input_area)
+
         # Layout: interactive prompt widgets + ruled input at bottom.
         # The sudo, approval, and clarify widgets appear above the input when
         # the corresponding interactive prompt is active.
+        completions_menu = CompletionsMenu(max_height=12, scroll_offset=1)
+
         layout = Layout(
-            HSplit([
-                Window(height=0),
-                sudo_widget,
-                secret_widget,
-                approval_widget,
-                clarify_widget,
-                spinner_widget,
-                spacer,
-                status_bar,
-                input_rule_top,
-                image_bar,
-                input_area,
-                input_rule_bot,
-                voice_status_bar,
-                CompletionsMenu(max_height=12, scroll_offset=1),
-            ])
+            HSplit(
+                self._build_tui_layout_children(
+                    sudo_widget=sudo_widget,
+                    secret_widget=secret_widget,
+                    approval_widget=approval_widget,
+                    clarify_widget=clarify_widget,
+                    spinner_widget=spinner_widget,
+                    spacer=spacer,
+                    status_bar=status_bar,
+                    input_rule_top=input_rule_top,
+                    image_bar=image_bar,
+                    input_area=input_area,
+                    input_rule_bot=input_rule_bot,
+                    voice_status_bar=voice_status_bar,
+                    completions_menu=completions_menu,
+                )
+            )
         )
         
         # Style for the application
@@ -6877,28 +7031,34 @@ class HermesCLI:
                     paste_match = _re.match(r'\[Pasted text #\d+: \d+ lines → (.+)\]', user_input) if isinstance(user_input, str) else None
                     if paste_match:
                         paste_path = Path(paste_match.group(1))
+                        _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
                         if paste_path.exists():
                             full_text = paste_path.read_text(encoding="utf-8")
                             line_count = full_text.count('\n') + 1
                             print()
+                            ChatConsole().print(_user_bar)
                             ChatConsole().print(
                                 f"[bold {_accent_hex()}]●[/] [bold]{_escape(f'[Pasted text: {line_count} lines]')}[/]"
                             )
                             user_input = full_text
                         else:
                             print()
+                            ChatConsole().print(_user_bar)
                             ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]")
                     else:
+                        _user_bar = f"[{_accent_hex()}]{'─' * 40}[/]"
                         if '\n' in user_input:
                             first_line = user_input.split('\n')[0]
                             line_count = user_input.count('\n') + 1
                             print()
+                            ChatConsole().print(_user_bar)
                             ChatConsole().print(
                                 f"[bold {_accent_hex()}]●[/] [bold]{_escape(first_line)}[/] "
                                 f"[dim](+{line_count - 1} lines)[/]"
                             )
                         else:
                             print()
+                            ChatConsole().print(_user_bar)
                             ChatConsole().print(f"[bold {_accent_hex()}]●[/] [bold]{_escape(user_input)}[/]")
                     
                     # Show image attachment count
@@ -7182,7 +7342,10 @@ def main(
                     route_label=turn_route["label"],
                 ):
                     cli.agent.quiet_mode = True
-                    result = cli.agent.run_conversation(query)
+                    result = cli.agent.run_conversation(
+                        user_message=query,
+                        conversation_history=cli.conversation_history,
+                    )
                     response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                     if response:
                         print(response)

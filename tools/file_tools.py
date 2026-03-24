@@ -12,6 +12,7 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+
 _EXPECTED_WRITE_ERRNOS = {errno.EACCES, errno.EPERM, errno.EROFS}
 
 
