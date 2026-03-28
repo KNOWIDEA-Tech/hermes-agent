@@ -154,11 +154,10 @@ from .delegate_tool import (
     DELEGATE_TASK_SCHEMA,
 )
 
-# File tools have no external requirements - they use the terminal backend
+# File tools use Python built-in I/O — no external requirements.
 def check_file_requirements():
-    """File tools only require terminal backend to be available."""
-    from .terminal_tool import check_terminal_requirements
-    return check_terminal_requirements()
+    """File tools have no external requirements."""
+    return True
 
 __all__ = [
     # Web tools
