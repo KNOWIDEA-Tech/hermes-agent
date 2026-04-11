@@ -56,6 +56,25 @@ DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
 
+# ---------------------------------------------------------------------------
+# Thread-local sandbox environment
+# ---------------------------------------------------------------------------
+# Allows callers (e.g. Modal concurrent handlers) to inject per-execution
+# env vars into the child subprocess without mutating the process-global
+# os.environ. Each thread sets its own dict; the sandbox merges it in.
+
+_sandbox_tls = threading.local()
+
+
+def set_sandbox_env(env: Dict[str, str]) -> None:
+    """Set per-thread extra environment variables for sandbox child processes."""
+    _sandbox_tls.env = env
+
+
+def get_sandbox_env() -> Dict[str, str]:
+    """Get per-thread extra environment variables (empty dict if unset)."""
+    return getattr(_sandbox_tls, "env", {})
+
 
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
@@ -471,6 +490,9 @@ def execute_code(
         _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
         if _tz_name:
             child_env["TZ"] = _tz_name
+        # Merge per-thread sandbox env (set by Modal concurrent handlers etc.)
+        # Applied last so it can override any of the above.
+        child_env.update(get_sandbox_env())
 
         proc = subprocess.Popen(
             [sys.executable, "script.py"],
