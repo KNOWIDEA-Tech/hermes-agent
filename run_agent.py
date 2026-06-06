@@ -6385,8 +6385,15 @@ class AIAgent:
                     # 529 (Anthropic overloaded) is also transient.
                     # Also catch local validation errors (ValueError, TypeError) — these
                     # are programming bugs, not transient failures.
+                    # EXCEPT json.JSONDecodeError (a ValueError subclass): an unparseable
+                    # provider response (truncated body, gateway HTML, SSE mismatch on a
+                    # large/slow request) is transient, not a local bug — let it retry with
+                    # backoff instead of aborting on attempt 1.
                     _RETRYABLE_STATUS_CODES = {413, 429, 529}
-                    is_local_validation_error = isinstance(api_error, (ValueError, TypeError))
+                    is_local_validation_error = (
+                        isinstance(api_error, (ValueError, TypeError))
+                        and not isinstance(api_error, json.JSONDecodeError)
+                    )
                     # Detect generic 400s from Anthropic OAuth (transient server-side failures).
                     # Real invalid_request_error responses include a descriptive message;
                     # transient ones contain only "Error" or are empty. (ref: issue #1608)
