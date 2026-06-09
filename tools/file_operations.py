@@ -314,6 +314,41 @@ MAX_LINES = 2000
 MAX_LINE_LENGTH = 2000
 MAX_FILE_SIZE = 50 * 1024  # 50KB
 
+# Matches the LINE_NUM|CONTENT gutter that read_file prepends (see
+# _add_line_numbers). Used to detect read output pasted back into a write.
+_GUTTER_LINE = re.compile(r'^[ \t]*(\d+)\|')
+
+
+def strip_pasted_line_numbers(content: str) -> Tuple[str, int]:
+    """
+    Detect and strip a read_file line-number gutter pasted into write content.
+
+    read_file returns 'LINE_NUM|CONTENT' lines; models sometimes copy blocks
+    from a read result into write_file content verbatim, persisting the gutter
+    into the file (it then breaks CSS/HTML/code). The signature is unmistakable:
+    many lines prefixed 'NNN|' with sequentially increasing numbers. Plain
+    content with pipes (tables, regexes) does not produce sequential runs.
+
+    Returns (cleaned_content, lines_stripped). lines_stripped is 0 when no
+    gutter was detected and content is returned unchanged.
+    """
+    lines = content.split('\n')
+    matched = [_GUTTER_LINE.match(line) for line in lines]
+    nums = [int(m.group(1)) for m in matched if m]
+    nonempty = sum(1 for line in lines if line.strip())
+
+    if len(nums) < 4 or nonempty == 0 or len(nums) / nonempty < 0.5:
+        return content, 0
+    consecutive = sum(1 for a, b in zip(nums, nums[1:]) if b == a + 1)
+    if consecutive / (len(nums) - 1) < 0.9:
+        return content, 0
+
+    cleaned = [
+        line[m.end():] if m else line
+        for line, m in zip(lines, matched)
+    ]
+    return '\n'.join(cleaned), len(nums)
+
 
 class ShellFileOperations(FileOperations):
     """

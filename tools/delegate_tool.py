@@ -31,13 +31,15 @@ DELEGATE_BLOCKED_TOOLS = frozenset([
     "clarify",         # no user interaction
     "memory",          # no writes to shared MEMORY.md
     "send_message",    # no cross-platform side effects
-    "execute_code",    # children should reason step-by-step, not write scripts
+    # execute_code is allowed — subagents need it to write large files without
+    # JSON serialization issues in write_file arguments.
 ])
 
 MAX_CONCURRENT_CHILDREN = 3
 MAX_DEPTH = 2  # parent (0) -> child (1) -> grandchild rejected (2)
 DEFAULT_MAX_ITERATIONS = 50
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
+DEFAULT_TIMEOUT_SECONDS = 300  # 5-minute wall-clock timeout per subagent task
 
 
 def check_delegate_requirements() -> bool:
@@ -490,11 +492,31 @@ def delegate_task(
         # Authoritative restore: reset global to parent's tool names after all children built
         _model_tools._last_resolved_tool_names = _parent_tool_names
 
+    timeout = cfg.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
+
     if n_tasks == 1:
-        # Single task -- run directly (no thread pool overhead)
+        # Single task -- run in thread with timeout
         _i, _t, child = children[0]
-        result = _run_single_child(0, _t["goal"], child, parent_agent)
-        results.append(result)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(
+                _run_single_child, task_index=0, goal=_t["goal"],
+                child=child, parent_agent=parent_agent,
+            )
+            try:
+                result = future.result(timeout=timeout)
+            except TimeoutError:
+                # Interrupt the child so it stops cleanly
+                if hasattr(child, 'interrupt'):
+                    child.interrupt()
+                result = {
+                    "task_index": 0,
+                    "status": "timeout",
+                    "summary": None,
+                    "error": f"Subagent timed out after {timeout}s",
+                    "api_calls": 0,
+                    "duration_seconds": timeout,
+                }
+            results.append(result)
     else:
         # Batch -- run in parallel with per-task progress lines
         completed_count = 0
@@ -512,9 +534,10 @@ def delegate_task(
                 )
                 futures[future] = i
 
-            for future in as_completed(futures):
+            try:
+              for future in as_completed(futures, timeout=timeout):
                 try:
-                    entry = future.result()
+                    entry = future.result(timeout=0)
                 except Exception as exc:
                     idx = futures[future]
                     entry = {
@@ -550,6 +573,19 @@ def delegate_task(
                         spinner_ref.update_text(f"🔀 {remaining} task{'s' if remaining != 1 else ''} remaining")
                     except Exception as e:
                         logger.debug("Spinner update_text failed: %s", e)
+            except TimeoutError:
+                # as_completed timed out — mark remaining futures as timed out
+                for future, idx in futures.items():
+                    if not future.done():
+                        future.cancel()
+                        results.append({
+                            "task_index": idx,
+                            "status": "timeout",
+                            "summary": None,
+                            "error": f"Subagent timed out after {timeout}s",
+                            "api_calls": 0,
+                            "duration_seconds": timeout,
+                        })
 
         # Sort by task_index so results match input order
         results.sort(key=lambda r: r["task_index"])

@@ -7,7 +7,7 @@ import logging
 import os
 import threading
 from typing import Optional
-from tools.file_operations import ShellFileOperations
+from tools.file_operations import ShellFileOperations, strip_pasted_line_numbers
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -289,9 +289,23 @@ def notify_other_tool_call(task_id: str = "default"):
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     """Write content to a file."""
     try:
+        content, gutter_lines = strip_pasted_line_numbers(content)
+        if gutter_lines:
+            logger.warning(
+                "write_file: stripped %d pasted read_file line-number prefixes ('NNN|') from %s",
+                gutter_lines, path,
+            )
         file_ops = _get_file_ops(task_id)
         result = file_ops.write_file(path, content)
-        return json.dumps(result.to_dict(), ensure_ascii=False)
+        result_dict = result.to_dict()
+        if gutter_lines:
+            result_dict["line_number_gutter_stripped"] = gutter_lines
+            result_dict["warning"] = (
+                f"Content contained {gutter_lines} 'LINE_NUM|' prefixes copied from a "
+                "read_file result; they were stripped before writing. Do not include "
+                "the line-number gutter when copying file content."
+            )
+        return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
         if _is_expected_write_exception(e):
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)

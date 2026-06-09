@@ -5441,6 +5441,7 @@ class AIAgent:
         # so subagent usage from a previous turn doesn't eat into the next one.
         self._invalid_tool_retries = 0
         self._invalid_json_retries = 0
+        self._invalid_json_total_retries = 0  # Total across all cycles (capped at 12)
         self._empty_content_retries = 0
         self._incomplete_scratchpad_retries = 0
         self._codex_incomplete_retries = 0
@@ -6399,8 +6400,15 @@ class AIAgent:
                     # 529 (Anthropic overloaded) is also transient.
                     # Also catch local validation errors (ValueError, TypeError) — these
                     # are programming bugs, not transient failures.
+                    # EXCEPT json.JSONDecodeError (a ValueError subclass): an unparseable
+                    # provider response (truncated body, gateway HTML, SSE mismatch on a
+                    # large/slow request) is transient, not a local bug — let it retry with
+                    # backoff instead of aborting on attempt 1.
                     _RETRYABLE_STATUS_CODES = {413, 429, 529}
-                    is_local_validation_error = isinstance(api_error, (ValueError, TypeError)) and not isinstance(api_error, json.JSONDecodeError)
+                    is_local_validation_error = (
+                        isinstance(api_error, (ValueError, TypeError))
+                        and not isinstance(api_error, json.JSONDecodeError)
+                    )
                     # Detect generic 400s from Anthropic OAuth (transient server-side failures).
                     # Real invalid_request_error responses include a descriptive message;
                     # transient ones contain only "Error" or are empty. (ref: issue #1608)
@@ -6744,10 +6752,34 @@ class AIAgent:
                     if invalid_json_args:
                         # Track retries for invalid JSON arguments
                         self._invalid_json_retries += 1
-                        
+                        self._invalid_json_total_retries += 1
+
                         tool_name, error_msg = invalid_json_args[0]
                         self._vprint(f"{self.log_prefix}⚠️  Invalid JSON in tool call arguments for '{tool_name}': {error_msg}")
-                        
+
+                        # Hard cap: after 6 total retries across all cycles, stop retrying
+                        # and instruct the model to use an alternative approach.
+                        if self._invalid_json_total_retries >= 6:
+                            self._vprint(f"{self.log_prefix}❌ Hit total invalid JSON retry cap (6). Injecting fallback guidance...", force=True)
+                            self._invalid_json_retries = 0
+
+                            recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)
+                            messages.append(recovery_assistant)
+
+                            for tc in assistant_message.tool_calls:
+                                messages.append({
+                                    "role": "tool",
+                                    "tool_call_id": tc.id,
+                                    "content": (
+                                        "Error: Repeated invalid JSON in tool arguments (12 attempts). "
+                                        "STOP trying to use write_file with large content. Instead, use "
+                                        "execute_code to write the file via Python: "
+                                        "open('/path/to/file', 'w').write(content). "
+                                        "This avoids JSON serialization issues with large strings."
+                                    ),
+                                })
+                            continue
+
                         if self._invalid_json_retries < 3:
                             self._vprint(f"{self.log_prefix}🔄 Retrying API call ({self._invalid_json_retries}/3)...")
                             # Don't add anything to messages, just retry the API call
@@ -6756,12 +6788,12 @@ class AIAgent:
                             # Instead of returning partial, inject tool error results so the model can recover.
                             # Using tool results (not user messages) preserves role alternation.
                             self._vprint(f"{self.log_prefix}⚠️  Injecting recovery tool results for invalid JSON...")
-                            self._invalid_json_retries = 0  # Reset for next attempt
-                            
+                            self._invalid_json_retries = 0  # Reset for next cycle
+
                             # Append the assistant message with its (broken) tool_calls
                             recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)
                             messages.append(recovery_assistant)
-                            
+
                             # Respond with tool error results for each tool call
                             invalid_names = {name for name, _ in invalid_json_args}
                             for tc in assistant_message.tool_calls:
@@ -6769,8 +6801,8 @@ class AIAgent:
                                     err = next(e for n, e in invalid_json_args if n == tc.function.name)
                                     tool_result = (
                                         f"Error: Invalid JSON arguments. {err}. "
-                                        f"For tools with no required parameters, use an empty object: {{}}. "
-                                        f"Please retry with valid JSON."
+                                        f"Large file content often breaks JSON serialization. "
+                                        f"Use execute_code with Python open('/path','w').write(content) instead of write_file for large content."
                                     )
                                 else:
                                     tool_result = "Skipped: other tool call in this response had invalid JSON."

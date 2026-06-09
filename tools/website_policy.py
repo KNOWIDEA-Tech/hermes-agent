@@ -140,11 +140,15 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
     """
     global _cached_policy, _cached_policy_path, _cached_policy_time
 
-    resolved_path = str(config_path) if config_path else "__default__"
+    is_default = config_path is None
+    # Key the cache on the RESOLVED path, not a constant: HERMES_HOME can
+    # change at runtime (tests, per-request overrides), and a constant key
+    # would serve one home's policy for another's.
+    resolved_path = str(config_path) if config_path else str(_get_default_config_path())
     now = time.monotonic()
 
     # Return cached policy if still fresh and same path
-    if config_path is None:
+    if is_default:
         with _cache_lock:
             if (
                 _cached_policy is not None
@@ -193,10 +197,10 @@ def load_website_blocklist(config_path: Optional[Path] = None) -> Dict[str, Any]
     result = {"enabled": enabled, "rules": rules}
 
     # Cache the result (only for the default path — explicit paths are tests)
-    if config_path == _get_default_config_path():
+    if is_default:
         with _cache_lock:
             _cached_policy = result
-            _cached_policy_path = "__default__"
+            _cached_policy_path = resolved_path
             _cached_policy_time = now
 
     return result
@@ -243,10 +247,18 @@ def check_website_access(url: str, config_path: Optional[Path] = None) -> Option
     ``config_path`` explicitly (tests) to get strict error propagation.
     """
     # Fast path: if no explicit config_path and the cached policy is disabled
-    # or empty, skip all work (no YAML read, no host extraction).
+    # or empty, skip all work (no YAML read, no host extraction). Only valid
+    # when the cache is fresh AND keyed to the CURRENT default path —
+    # HERMES_HOME can change at runtime, and a stale "disabled" entry from a
+    # previous home must not fail-open the new home's blocklist.
     if config_path is None:
         with _cache_lock:
-            if _cached_policy is not None and not _cached_policy.get("enabled"):
+            if (
+                _cached_policy is not None
+                and not _cached_policy.get("enabled")
+                and _cached_policy_path == str(_get_default_config_path())
+                and (time.monotonic() - _cached_policy_time) < _CACHE_TTL_SECONDS
+            ):
                 return None
 
     host = _extract_host_from_urlish(url)
