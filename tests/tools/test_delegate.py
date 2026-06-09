@@ -510,8 +510,13 @@ class TestDelegateObservability(unittest.TestCase):
 
 class TestBlockedTools(unittest.TestCase):
     def test_blocked_tools_constant(self):
-        for tool in ["delegate_task", "clarify", "memory", "send_message", "execute_code"]:
+        for tool in ["delegate_task", "clarify", "memory", "send_message"]:
             self.assertIn(tool, DELEGATE_BLOCKED_TOOLS)
+
+    def test_execute_code_allowed_in_subagents(self):
+        # Deliberately unblocked: subagents need execute_code to write large
+        # files without JSON serialization issues in write_file arguments.
+        self.assertNotIn("execute_code", DELEGATE_BLOCKED_TOOLS)
 
     def test_constants(self):
         self.assertEqual(MAX_CONCURRENT_CHILDREN, 3)

@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = sys.platform != "win32"
 
+# Thread-local storage for per-execution sandbox environment variables.
+# Each executor thread gets its own copy so concurrent requests in the
+# same Modal container don't interfere with each other.
+_thread_local = threading.local()
+
+
+def set_sandbox_env(env: dict) -> None:
+    """Store per-execution env vars in thread-local storage.
+
+    Must be called inside the executor thread (threading.local is per-thread).
+    These vars are merged into the child subprocess environment by execute_code().
+    """
+    _thread_local.sandbox_env = env
+
+
+def get_sandbox_env() -> dict:
+    """Retrieve per-execution env vars from thread-local storage."""
+    return getattr(_thread_local, "sandbox_env", {})
+
+
 # The 7 tools allowed inside the sandbox. The intersection of this list
 # and the session's enabled tools determines which stubs are generated.
 SANDBOX_ALLOWED_TOOLS = frozenset([
@@ -480,11 +500,15 @@ def execute_code(
         _supa_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
         if _supa_key:
             child_env["SUPABASE_SERVICE_ROLE_KEY"] = _supa_key
+        # Snowflake programmatic access token is needed for data queries
+        # inside code execution. It's blocked by _SECRET_SUBSTRINGS so we
+        # inject it explicitly.
+        _sf_token = os.getenv("SNOWFLAKE_PROGRAMMATIC_ACCESS_TOKEN", "")
+        if _sf_token:
+            child_env["SNOWFLAKE_PROGRAMMATIC_ACCESS_TOKEN"] = _sf_token
         # Ensure the hermes-agent root is importable in the sandbox so
         # repo-root modules are available to child scripts.
         _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        _existing_pp = child_env.get("PYTHONPATH", "")
-        child_env["PYTHONPATH"] = _hermes_root + (os.pathsep + _existing_pp if _existing_pp else "")
         # Inject user's configured timezone so datetime.now() in sandboxed
         # code reflects the correct wall-clock time.
         _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
@@ -493,6 +517,26 @@ def execute_code(
         # Merge per-thread sandbox env (set by Modal concurrent handlers etc.)
         # Applied last so it can override any of the above.
         child_env.update(get_sandbox_env())
+
+        # Merge per-execution sandbox env vars (user ID, temp dir, Snowflake
+        # creds) set via set_sandbox_env() in the executor thread.
+        child_env.update(get_sandbox_env())
+
+        # Build PYTHONPATH AFTER merging sandbox env, so:
+        #  - hermes-agent root is always importable (repo modules)
+        #  - the per-execution HERMES_TMP_DIR is also importable, so the
+        #    agent can `import sf_connect` directly without manually doing
+        #    `sys.path.insert(0, os.environ["HERMES_TMP_DIR"])`. The
+        #    setup_sandbox helper drops sf_connect.py into that dir.
+        # This eliminates the "agent burns 5 turns on import retries before
+        # finally finding sf_connect" failure mode.
+        _existing_pp = child_env.get("PYTHONPATH", "")
+        _path_parts = [p for p in _existing_pp.split(os.pathsep) if p]
+        _user_tmp = child_env.get("HERMES_TMP_DIR", "")
+        for _entry in (_user_tmp, _hermes_root):
+            if _entry and _entry not in _path_parts:
+                _path_parts.insert(0, _entry)
+        child_env["PYTHONPATH"] = os.pathsep.join(_path_parts)
 
         proc = subprocess.Popen(
             [sys.executable, "script.py"],

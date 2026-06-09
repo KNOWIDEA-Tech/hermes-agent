@@ -66,6 +66,7 @@ from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
 import requests
+import httpx
 
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -4153,7 +4154,12 @@ class AIAgent:
             "model": self.model,
             "messages": sanitized_messages,
             "tools": self.tools if self.tools else None,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 900.0)),
+            "timeout": httpx.Timeout(
+                connect=15.0,
+                read=float(os.getenv("HERMES_API_TIMEOUT", 300.0)),
+                write=60.0,
+                pool=15.0,
+            ),
         }
 
         if self.max_tokens is not None:
@@ -6185,6 +6191,15 @@ class AIAgent:
                     # Enhanced error logging
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
+
+                    # Log timeout errors explicitly so retries are visible in Modal logs
+                    is_timeout = isinstance(api_error, (httpx.TimeoutException,)) or "timeout" in error_msg
+                    if is_timeout:
+                        logger.warning(
+                            "API timeout (attempt %s/%s): %s after %.1fs — will retry",
+                            retry_count, max_retries, error_type, elapsed_time,
+                        )
+
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s error=%s",
                         retry_count,
@@ -6385,8 +6400,15 @@ class AIAgent:
                     # 529 (Anthropic overloaded) is also transient.
                     # Also catch local validation errors (ValueError, TypeError) — these
                     # are programming bugs, not transient failures.
+                    # EXCEPT json.JSONDecodeError (a ValueError subclass): an unparseable
+                    # provider response (truncated body, gateway HTML, SSE mismatch on a
+                    # large/slow request) is transient, not a local bug — let it retry with
+                    # backoff instead of aborting on attempt 1.
                     _RETRYABLE_STATUS_CODES = {413, 429, 529}
-                    is_local_validation_error = isinstance(api_error, (ValueError, TypeError))
+                    is_local_validation_error = (
+                        isinstance(api_error, (ValueError, TypeError))
+                        and not isinstance(api_error, json.JSONDecodeError)
+                    )
                     # Detect generic 400s from Anthropic OAuth (transient server-side failures).
                     # Real invalid_request_error responses include a descriptive message;
                     # transient ones contain only "Error" or are empty. (ref: issue #1608)
@@ -6738,7 +6760,7 @@ class AIAgent:
                         # Hard cap: after 6 total retries across all cycles, stop retrying
                         # and instruct the model to use an alternative approach.
                         if self._invalid_json_total_retries >= 6:
-                            self._vprint(f"{self.log_prefix}❌ Hit total invalid JSON retry cap (6). Injecting fallback guidance...")
+                            self._vprint(f"{self.log_prefix}❌ Hit total invalid JSON retry cap (6). Injecting fallback guidance...", force=True)
                             self._invalid_json_retries = 0
 
                             recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)

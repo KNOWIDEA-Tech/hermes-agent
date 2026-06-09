@@ -598,20 +598,22 @@ def _parallel_search(query: str, limit: int = 5) -> dict:
     if is_interrupted():
         return {"error": "Interrupted", "success": False}
 
-    mode = os.getenv("PARALLEL_SEARCH_MODE", "agentic").lower().strip()
-    if mode not in ("fast", "one-shot", "agentic"):
-        mode = "agentic"
+    # parallel-web 1.x moved search/extract from `.beta` to the top-level client
+    # and replaced the fast/one-shot/agentic modes with basic/advanced. There is
+    # no max_results param any more — cap the rendered results by slicing.
+    mode = os.getenv("PARALLEL_SEARCH_MODE", "advanced").lower().strip()
+    if mode not in ("basic", "advanced"):
+        mode = "advanced"
 
     logger.info("Parallel search: '%s' (mode=%s, limit=%d)", query, mode, limit)
-    response = _get_parallel_client().beta.search(
+    response = _get_parallel_client().search(
         search_queries=[query],
         objective=query,
         mode=mode,
-        max_results=min(limit, 20),
     )
 
     web_results = []
-    for i, result in enumerate(response.results or []):
+    for i, result in enumerate((response.results or [])[:limit]):
         excerpts = result.excerpts or []
         web_results.append({
             "url": result.url or "",
@@ -634,9 +636,10 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
         return [{"url": u, "error": "Interrupted", "title": ""} for u in urls]
 
     logger.info("Parallel extract: %d URL(s)", len(urls))
-    response = await _get_async_parallel_client().beta.extract(
+    # parallel-web 1.x: extract moved to the top-level client; `full_content` is
+    # returned by default and is no longer a valid kwarg.
+    response = await _get_async_parallel_client().extract(
         urls=urls,
-        full_content=True,
     )
 
     results = []
@@ -664,6 +667,55 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
         })
 
     return results
+
+
+# ─── Backend failover helpers ─────────────────────────────────────────────────
+
+def _failover_order(primary: str) -> List[str]:
+    """Ordered key-based single-call backends to try.
+
+    Primary first (from ``_get_backend()``), then the other configured single-call
+    backend as a failover — so one provider's outage or SDK break can't blackhole
+    web search/fetch. Only includes backends whose API key is present (failover
+    never targets an unconfigured provider). Firecrawl is intentionally excluded:
+    it is the legacy fall-through handled inline by the callers.
+    """
+    keyed = {
+        "parallel": _has_env("PARALLEL_API_KEY"),
+        "tavily": _has_env("TAVILY_API_KEY"),
+    }
+    out: List[str] = []
+    for b in (primary, "parallel", "tavily"):
+        if keyed.get(b) and b not in out:
+            out.append(b)
+    return out
+
+
+def _search_single(backend: str, query: str, limit: int) -> dict:
+    """Run ONE key-based search backend (parallel|tavily) → normalized
+    ``{"success": True, "data": {"web": [...]}}`` dict, or raise on failure."""
+    if backend == "tavily":
+        logger.info("Tavily search: '%s' (limit: %d)", query, limit)
+        raw = _tavily_request("search", {
+            "query": query,
+            "max_results": min(limit, 20),
+            "include_raw_content": False,
+            "include_images": False,
+        })
+        return _normalize_tavily_search_results(raw)
+    return _parallel_search(query, limit)
+
+
+async def _extract_single(backend: str, safe_urls: List[str]) -> List[Dict[str, Any]]:
+    """Run ONE key-based extract backend (parallel|tavily) → results list, or raise."""
+    if backend == "tavily":
+        logger.info("Tavily extract: %d URL(s)", len(safe_urls))
+        raw = _tavily_request("extract", {
+            "urls": safe_urls,
+            "include_images": False,
+        })
+        return _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
+    return await _parallel_extract(safe_urls)
 
 
 def web_search_tool(query: str, limit: int = 5) -> str:
@@ -716,33 +768,37 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if is_interrupted():
             return json.dumps({"error": "Interrupted", "success": False})
 
-        # Dispatch to the configured backend
-        backend = _get_backend()
-        if backend == "parallel":
-            response_data = _parallel_search(query, limit)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
+        # Dispatch with failover across the key-based single-call backends
+        # (parallel → tavily). One provider erroring (SDK break, quota, outage)
+        # falls over to the other instead of blackholing search. Firecrawl, if
+        # configured, remains the final fall-through below.
+        _order = _failover_order(_get_backend())
+        _errs: List[str] = []
+        for _i, _b in enumerate(_order):
+            try:
+                response_data = _search_single(_b, query, limit)
+                debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+                if _i > 0:
+                    debug_call_data["failover_to"] = _b
+                    logger.warning("web_search failed over to '%s' (after: %s)", _b, "; ".join(_errs))
+                result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+                debug_call_data["final_response_size"] = len(result_json)
+                _debug.log_call("web_search_tool", debug_call_data)
+                _debug.save()
+                return result_json
+            except Exception as _be:
+                _errs.append("%s: %s" % (_b, _be))
+                logger.warning("web_search backend '%s' failed: %s", _b, _be)
+
+        if not (_has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")):
+            error_msg = "Error searching web: all backends failed — " + "; ".join(_errs)
+            debug_call_data["error"] = error_msg
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
-            return result_json
+            return json.dumps({"error": error_msg}, ensure_ascii=False)
 
-        if backend == "tavily":
-            logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-            raw = _tavily_request("search", {
-                "query": query,
-                "max_results": min(limit, 20),
-                "include_raw_content": False,
-                "include_images": False,
-            })
-            response_data = _normalize_tavily_search_results(raw)
-            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
-            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
-            debug_call_data["final_response_size"] = len(result_json)
-            _debug.log_call("web_search_tool", debug_call_data)
-            _debug.save()
-            return result_json
-
+        if _errs:
+            logger.warning("web_search falling back to firecrawl (after: %s)", "; ".join(_errs))
         logger.info("Searching the web for: '%s' (limit: %d)", query, limit)
 
         response = _get_firecrawl_client().search(
@@ -863,6 +919,8 @@ async def web_extract_tool(
         logger.info("Extracting content from %d URL(s)", len(urls))
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
+        # ── Website policy — block listed hosts before any backend (parallel/tavily
+        #    included, not just the Firecrawl fall-through) ──
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
         for url in urls:
@@ -871,25 +929,50 @@ async def web_extract_tool(
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
                 })
-            else:
-                safe_urls.append(url)
+                continue
+            policy = check_website_access(url)
+            if policy:
+                logger.info("Blocked web_extract for %s by rule %s", policy["host"], policy["rule"])
+                ssrf_blocked.append({
+                    "url": url, "title": "", "content": "",
+                    "error": policy["message"],
+                    "blocked_by_policy": {"host": policy["host"], "rule": policy["rule"], "source": policy["source"]},
+                })
+                continue
+            safe_urls.append(url)
 
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
             results = []
         else:
-            backend = _get_backend()
+            # Failover across the key-based single-call backends (parallel → tavily);
+            # Firecrawl (if configured) is the final fall-through.
+            _order = _failover_order(_get_backend())
+            results = None
+            _errs: List[str] = []
+            for _i, _b in enumerate(_order):
+                try:
+                    results = await _extract_single(_b, safe_urls)
+                    if _i > 0:
+                        logger.warning("web_extract failed over to '%s' (after: %s)", _b, "; ".join(_errs))
+                    break
+                except Exception as _be:
+                    _errs.append("%s: %s" % (_b, _be))
+                    logger.warning("web_extract backend '%s' failed: %s", _b, _be)
+                    results = None
 
-            if backend == "parallel":
-                results = await _parallel_extract(safe_urls)
-            elif backend == "tavily":
-                logger.info("Tavily extract: %d URL(s)", len(safe_urls))
-                raw = _tavily_request("extract", {
-                    "urls": safe_urls,
-                    "include_images": False,
-                })
-                results = _normalize_tavily_documents(raw, fallback_url=safe_urls[0] if safe_urls else "")
-            else:
+            # Firecrawl fall-through — gate on client constructibility rather than
+            # env sniffing (equivalent in prod: the client raises when unconfigured).
+            _firecrawl_available = False
+            if results is None:
+                try:
+                    _get_firecrawl_client()
+                    _firecrawl_available = True
+                except Exception:
+                    _firecrawl_available = False
+            if results is None and _firecrawl_available:
+                if _errs:
+                    logger.warning("web_extract falling back to firecrawl (after: %s)", "; ".join(_errs))
                 # ── Firecrawl extraction ──
                 # Determine requested formats for Firecrawl v2
                 formats: List[str] = []
@@ -1008,7 +1091,38 @@ async def web_extract_tool(
                             "error": str(scrape_err)
                         })
 
-        # Merge any SSRF-blocked results back in
+            # All configured backends failed (and no Firecrawl fallback) — surface per-URL.
+            if results is None:
+                results = [
+                    {"url": u, "title": "", "content": "", "raw_content": "",
+                     "error": "All extract backends failed: " + "; ".join(_errs)}
+                    for u in safe_urls
+                ]
+
+            # ── Re-check final URLs after redirects, uniformly for every backend.
+            # A request to an allowed host can redirect to a policy-blocked one;
+            # the Firecrawl loop checks this inline, parallel/tavily results did not.
+            for _idx, _r in enumerate(results):
+                if _r.get("error") or _r.get("blocked_by_policy"):
+                    continue
+                _final_blocked = check_website_access(_r.get("url", ""))
+                if _final_blocked:
+                    logger.info(
+                        "Blocked redirected web_extract for %s by rule %s",
+                        _final_blocked["host"], _final_blocked["rule"],
+                    )
+                    results[_idx] = {
+                        "url": _r.get("url", ""), "title": _r.get("title", ""),
+                        "content": "", "raw_content": "",
+                        "error": _final_blocked["message"],
+                        "blocked_by_policy": {
+                            "host": _final_blocked["host"],
+                            "rule": _final_blocked["rule"],
+                            "source": _final_blocked["source"],
+                        },
+                    }
+
+        # Merge any SSRF/policy-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
 
