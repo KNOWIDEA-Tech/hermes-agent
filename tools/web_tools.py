@@ -919,6 +919,8 @@ async def web_extract_tool(
         logger.info("Extracting content from %d URL(s)", len(urls))
 
         # ── SSRF protection — filter out private/internal URLs before any backend ──
+        # ── Website policy — block listed hosts before any backend (parallel/tavily
+        #    included, not just the Firecrawl fall-through) ──
         safe_urls = []
         ssrf_blocked: List[Dict[str, Any]] = []
         for url in urls:
@@ -927,8 +929,17 @@ async def web_extract_tool(
                     "url": url, "title": "", "content": "",
                     "error": "Blocked: URL targets a private or internal network address",
                 })
-            else:
-                safe_urls.append(url)
+                continue
+            policy = check_website_access(url)
+            if policy:
+                logger.info("Blocked web_extract for %s by rule %s", policy["host"], policy["rule"])
+                ssrf_blocked.append({
+                    "url": url, "title": "", "content": "",
+                    "error": policy["message"],
+                    "blocked_by_policy": {"host": policy["host"], "rule": policy["rule"], "source": policy["source"]},
+                })
+                continue
+            safe_urls.append(url)
 
         # Dispatch only safe URLs to the configured backend
         if not safe_urls:
@@ -950,7 +961,16 @@ async def web_extract_tool(
                     logger.warning("web_extract backend '%s' failed: %s", _b, _be)
                     results = None
 
-            if results is None and (_has_env("FIRECRAWL_API_KEY") or _has_env("FIRECRAWL_API_URL")):
+            # Firecrawl fall-through — gate on client constructibility rather than
+            # env sniffing (equivalent in prod: the client raises when unconfigured).
+            _firecrawl_available = False
+            if results is None:
+                try:
+                    _get_firecrawl_client()
+                    _firecrawl_available = True
+                except Exception:
+                    _firecrawl_available = False
+            if results is None and _firecrawl_available:
                 if _errs:
                     logger.warning("web_extract falling back to firecrawl (after: %s)", "; ".join(_errs))
                 # ── Firecrawl extraction ──
@@ -1079,7 +1099,30 @@ async def web_extract_tool(
                     for u in safe_urls
                 ]
 
-        # Merge any SSRF-blocked results back in
+            # ── Re-check final URLs after redirects, uniformly for every backend.
+            # A request to an allowed host can redirect to a policy-blocked one;
+            # the Firecrawl loop checks this inline, parallel/tavily results did not.
+            for _idx, _r in enumerate(results):
+                if _r.get("error") or _r.get("blocked_by_policy"):
+                    continue
+                _final_blocked = check_website_access(_r.get("url", ""))
+                if _final_blocked:
+                    logger.info(
+                        "Blocked redirected web_extract for %s by rule %s",
+                        _final_blocked["host"], _final_blocked["rule"],
+                    )
+                    results[_idx] = {
+                        "url": _r.get("url", ""), "title": _r.get("title", ""),
+                        "content": "", "raw_content": "",
+                        "error": _final_blocked["message"],
+                        "blocked_by_policy": {
+                            "host": _final_blocked["host"],
+                            "rule": _final_blocked["rule"],
+                            "source": _final_blocked["source"],
+                        },
+                    }
+
+        # Merge any SSRF/policy-blocked results back in
         if ssrf_blocked:
             results = ssrf_blocked + results
 

@@ -6760,7 +6760,7 @@ class AIAgent:
                         # Hard cap: after 6 total retries across all cycles, stop retrying
                         # and instruct the model to use an alternative approach.
                         if self._invalid_json_total_retries >= 6:
-                            self._vprint(f"{self.log_prefix}❌ Hit total invalid JSON retry cap (6). Injecting fallback guidance...")
+                            self._vprint(f"{self.log_prefix}❌ Hit total invalid JSON retry cap (6). Injecting fallback guidance...", force=True)
                             self._invalid_json_retries = 0
 
                             recovery_assistant = self._build_assistant_message(assistant_message, finish_reason)
