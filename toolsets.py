@@ -64,6 +64,8 @@ _HERMES_CORE_TOOLS = [
     "honcho_context", "honcho_profile", "honcho_search", "honcho_conclude",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # User notes (read-only access to user's personal notes vault)
+    "list_user_notes", "read_user_note", "search_user_notes",
 ]
 
 
@@ -205,6 +207,12 @@ TOOLSETS = {
     "homeassistant": {
         "description": "Home Assistant smart home control and monitoring",
         "tools": ["ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service"],
+        "includes": []
+    },
+
+    "user_notes": {
+        "description": "Read-only access to the user's personal notes vault (preferences, context, instructions)",
+        "tools": ["list_user_notes", "read_user_note", "search_user_notes"],
         "includes": []
     },
 

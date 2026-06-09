@@ -66,6 +66,7 @@ from tools.interrupt import set_interrupt as _set_interrupt
 from tools.browser_tool import cleanup_browser
 
 import requests
+import httpx
 
 from hermes_constants import OPENROUTER_BASE_URL
 
@@ -4153,7 +4154,12 @@ class AIAgent:
             "model": self.model,
             "messages": sanitized_messages,
             "tools": self.tools if self.tools else None,
-            "timeout": float(os.getenv("HERMES_API_TIMEOUT", 900.0)),
+            "timeout": httpx.Timeout(
+                connect=15.0,
+                read=float(os.getenv("HERMES_API_TIMEOUT", 300.0)),
+                write=60.0,
+                pool=15.0,
+            ),
         }
 
         if self.max_tokens is not None:
@@ -6185,6 +6191,15 @@ class AIAgent:
                     # Enhanced error logging
                     error_type = type(api_error).__name__
                     error_msg = str(api_error).lower()
+
+                    # Log timeout errors explicitly so retries are visible in Modal logs
+                    is_timeout = isinstance(api_error, (httpx.TimeoutException,)) or "timeout" in error_msg
+                    if is_timeout:
+                        logger.warning(
+                            "API timeout (attempt %s/%s): %s after %.1fs — will retry",
+                            retry_count, max_retries, error_type, elapsed_time,
+                        )
+
                     logger.warning(
                         "API call failed (attempt %s/%s) error_type=%s %s error=%s",
                         retry_count,
