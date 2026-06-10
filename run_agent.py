@@ -3883,8 +3883,10 @@ class AIAgent:
 
             # Re-evaluate prompt caching for the new provider/model
             is_native_anthropic = fb_api_mode == "anthropic_messages"
+            _fb_force_cache = os.getenv("HERMES_FORCE_PROMPT_CACHING", "").lower() in ("1", "true", "yes")
             self._use_prompt_caching = (
-                ("openrouter" in fb_base_url.lower() and _model_supports_cache_control(fb_model))
+                ("openrouter" in fb_base_url.lower()
+                 and (_model_supports_cache_control(fb_model) or _fb_force_cache))
                 or is_native_anthropic
             )
             if os.getenv("HERMES_DISABLE_PROMPT_CACHING", "").lower() in ("1", "true", "yes"):
