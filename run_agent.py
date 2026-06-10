@@ -596,7 +596,9 @@ class AIAgent:
         )
         if os.getenv("HERMES_DISABLE_PROMPT_CACHING", "").lower() in ("1", "true", "yes"):
             self._use_prompt_caching = False
-        self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
+        # Cache TTL: 5m (1.25x write) default; HERMES_CACHE_TTL=1h (2x write)
+        # keeps the prefix warm across slow multi-minute turns (long renders).
+        self._cache_ttl = os.getenv("HERMES_CACHE_TTL", "5m")
         
         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
         # Warnings are injected into the last tool result JSON (not as separate
