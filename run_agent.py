@@ -227,6 +227,19 @@ _PARALLEL_SAFE_TOOLS = frozenset({
 # File tools can run concurrently when they target independent paths.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
 
+# Providers whose OpenRouter endpoints accept explicit Anthropic-style
+# cache_control breakpoints. Anthropic documents it; Alibaba/Qwen uses the
+# identical explicit syntax per OpenRouter's prompt-caching guide.
+_CACHE_CONTROL_MODEL_PREFIXES = ("claude", "qwen")
+
+
+def _model_supports_cache_control(model: str) -> bool:
+    """True when the model's provider supports explicit cache_control via
+    OpenRouter (substring match mirrors the historical 'claude' check)."""
+    lowered = (model or "").lower()
+    return any(p in lowered for p in _CACHE_CONTROL_MODEL_PREFIXES)
+
+
 # Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
 
@@ -567,13 +580,22 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Prompt caching: auto-enabled for providers that support explicit
+        # cache_control breakpoints via OpenRouter (Anthropic/Claude and
+        # Alibaba/Qwen use the same syntax). Reduces input costs by ~75-90% on
+        # multi-turn conversations by caching the conversation prefix. Uses
+        # system_and_3 strategy (4 breakpoints). HERMES_FORCE_PROMPT_CACHING=1
+        # opts any OpenRouter model in (for providers added later);
+        # HERMES_DISABLE_PROMPT_CACHING=1 turns it off entirely.
         is_openrouter = "openrouter" in self._base_url_lower
-        is_claude = "claude" in self.model.lower()
+        is_cacheable_provider = _model_supports_cache_control(self.model)
         is_native_anthropic = self.api_mode == "anthropic_messages"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+        _force_cache = os.getenv("HERMES_FORCE_PROMPT_CACHING", "").lower() in ("1", "true", "yes")
+        self._use_prompt_caching = (
+            (is_openrouter and (is_cacheable_provider or _force_cache)) or is_native_anthropic
+        )
+        if os.getenv("HERMES_DISABLE_PROMPT_CACHING", "").lower() in ("1", "true", "yes"):
+            self._use_prompt_caching = False
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
         
         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
@@ -3862,9 +3884,11 @@ class AIAgent:
             # Re-evaluate prompt caching for the new provider/model
             is_native_anthropic = fb_api_mode == "anthropic_messages"
             self._use_prompt_caching = (
-                ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
+                ("openrouter" in fb_base_url.lower() and _model_supports_cache_control(fb_model))
                 or is_native_anthropic
             )
+            if os.getenv("HERMES_DISABLE_PROMPT_CACHING", "").lower() in ("1", "true", "yes"):
+                self._use_prompt_caching = False
 
             print(
                 f"{self.log_prefix}🔄 Primary model failed — switching to fallback: "
