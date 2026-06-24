@@ -4239,7 +4239,7 @@ class AIAgent:
             "anthropic/",
             "openai/",
             "x-ai/",
-            "google/gemini-2",
+            "google/gemini",
             "qwen/qwen3",
         )
         return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
