@@ -85,6 +85,7 @@ from agent.context_compressor import ContextCompressor
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent import observability as obs
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
     get_cute_tool_message as _get_cute_tool_message_impl,
@@ -666,6 +667,14 @@ class AIAgent:
                 ]:
                     logging.getLogger(quiet_logger).setLevel(logging.ERROR)
         
+        # Observability (Logfire) — opt-in, no-op without LOGFIRE_TOKEN. Must run
+        # before the OpenAI client is built below so instrument_openai() patches it.
+        try:
+            from agent.observability import configure_observability
+            configure_observability(service_name="hermes-agent")
+        except Exception:
+            pass  # never let observability setup break agent init
+
         # Internal stream callback (set during streaming TTS).
         # Initialized here so _vprint can reference it before run_conversation.
         self._stream_callback = None
@@ -3435,8 +3444,12 @@ class AIAgent:
         """
         result = {"response": None, "error": None}
         request_client_holder = {"client": None}
+        # Propagate tracing context into the worker thread so the LLM span nests
+        # under the active hermes.run span (OTEL context is thread-local).
+        _otel_ctx = obs.capture_context()
 
         def _call():
+            _otel_tok = obs.attach_context(_otel_ctx)
             try:
                 if self.api_mode == "codex_responses":
                     request_client_holder["client"] = self._create_request_openai_client(reason="codex_stream_request")
@@ -3453,6 +3466,7 @@ class AIAgent:
             except Exception as e:
                 result["error"] = e
             finally:
+                obs.detach_context(_otel_tok)
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="request_complete")
@@ -3734,7 +3748,10 @@ class AIAgent:
                 # Return the native Anthropic Message for downstream processing
                 return stream.get_final_message()
 
+        _otel_ctx = obs.capture_context()  # propagate trace context into the stream worker thread
+
         def _call():
+            _otel_tok = obs.attach_context(_otel_ctx)
             try:
                 if self.api_mode == "anthropic_messages":
                     self._try_refresh_anthropic_client_credentials()
@@ -3759,6 +3776,7 @@ class AIAgent:
                     except Exception as fallback_err:
                         result["error"] = fallback_err
             finally:
+                obs.detach_context(_otel_tok)
                 request_client = request_client_holder.get("client")
                 if request_client is not None:
                     self._close_request_openai_client(request_client, reason="stream_request_complete")
@@ -4801,15 +4819,19 @@ class AIAgent:
         # ── Concurrent execution ─────────────────────────────────────────
         # Each slot holds (function_name, function_args, function_result, duration, error_flag)
         results = [None] * num_tools
+        _otel_ctx = obs.capture_context()  # propagate trace context into tool worker threads
 
         def _run_tool(index, tool_call, function_name, function_args):
             """Worker function executed in a thread."""
+            _otel_tok = obs.attach_context(_otel_ctx)
             start = time.time()
             try:
                 result = self._invoke_tool(function_name, function_args, effective_task_id)
             except Exception as tool_error:
                 result = f"Error executing tool '{function_name}': {tool_error}"
                 logger.error("_invoke_tool raised for %s: %s", function_name, tool_error, exc_info=True)
+            finally:
+                obs.detach_context(_otel_tok)
             duration = time.time() - start
             is_error, _ = _detect_tool_failure(function_name, result)
             results[index] = (function_name, function_args, result, duration, is_error)
@@ -5396,6 +5418,7 @@ class AIAgent:
 
         return final_response
 
+    @obs.instrument_run
     def run_conversation(
         self,
         user_message: str,
