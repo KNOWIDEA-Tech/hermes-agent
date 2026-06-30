@@ -40,6 +40,19 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _dummy_api_credentials(monkeypatch):
+    """Give AIAgent a placeholder API key so its client constructs under CI.
+
+    The agent builds an OpenAI/OpenRouter client in __init__ (raising "Missing
+    credentials" when no key is set), but unit tests mock every actual network
+    call — so a dummy key is all that's needed. Only fills in keys that aren't
+    already set, so tests that exercise explicit auth behavior keep control."""
+    for var in ("OPENROUTER_API_KEY", "OPENAI_API_KEY"):
+        if not os.getenv(var):
+            monkeypatch.setenv(var, "sk-test-dummy-key")
+
+
 @pytest.fixture()
 def tmp_dir(tmp_path):
     """Provide a temporary directory that is cleaned up automatically."""
