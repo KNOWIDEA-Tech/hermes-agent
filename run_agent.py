@@ -6093,6 +6093,25 @@ class AIAgent:
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
 
+                        # Surface model-agnostic cost + tokens to the trace as a
+                        # queryable event. Prefers OpenRouter's real billed cost
+                        # (usage.cost), falls back to Hermes' dynamic estimate, so
+                        # it stays correct when models are switched or added.
+                        _or_cost = getattr(response.usage, "cost", None)
+                        if _or_cost is None and getattr(response.usage, "model_extra", None):
+                            _or_cost = (response.usage.model_extra or {}).get("cost")
+                        _cost_usd = _or_cost if _or_cost is not None else cost_result.amount_usd
+                        obs.info(
+                            "llm_usage",
+                            model=self.model,
+                            response_model=getattr(response, "model", None),
+                            input_tokens=canonical_usage.input_tokens,
+                            output_tokens=canonical_usage.output_tokens,
+                            total_tokens=total_tokens,
+                            cost_usd=float(_cost_usd) if _cost_usd is not None else None,
+                            cost_source="openrouter" if _or_cost is not None else cost_result.source,
+                        )
+
                         # Persist token counts to session DB for /insights.
                         # Gateway sessions persist via session_store.update_session()
                         # after run_conversation returns, so only persist here for
