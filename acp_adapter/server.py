@@ -12,7 +12,6 @@ import acp
 from acp.schema import (
     AgentCapabilities,
     AuthenticateResponse,
-    AuthMethod,
     ClientCapabilities,
     EmbeddedResourceContentBlock,
     ForkSessionResponse,
@@ -33,6 +32,14 @@ from acp.schema import (
     TextContentBlock,
     Usage,
 )
+
+# AuthMethod was added in a later agent-client-protocol release than the pinned
+# floor (>=0.8.1); import it optionally so the adapter still loads on the older
+# schema (auth advertising is simply skipped when it's unavailable).
+try:
+    from acp.schema import AuthMethod
+except ImportError:  # pragma: no cover - depends on installed acp version
+    AuthMethod = None
 
 from acp_adapter.auth import detect_provider, has_provider
 from acp_adapter.events import (
@@ -101,7 +108,7 @@ class HermesACPAgent(acp.Agent):
     ) -> InitializeResponse:
         provider = detect_provider()
         auth_methods = None
-        if provider:
+        if provider and AuthMethod is not None:
             auth_methods = [
                 AuthMethod(
                     id=provider,

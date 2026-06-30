@@ -28,6 +28,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import registry
 from toolsets import resolve_toolset, validate_toolset
+from agent import observability as obs
 
 logger = logging.getLogger(__name__)
 
@@ -366,6 +367,7 @@ _AGENT_LOOP_TOOLS = {"todo", "memory", "session_search", "delegate_task"}
 _READ_SEARCH_TOOLS = {"read_file", "search_files"}
 
 
+@obs.instrument_tool
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],

@@ -253,12 +253,22 @@ def _run_single_child(
     goal: str,
     child=None,
     parent_agent=None,
+    _otel_ctx=None,
     **_kwargs,
 ) -> Dict[str, Any]:
     """
     Run a pre-built child agent. Called from within a thread.
     Returns a structured result dict.
     """
+    # Re-attach the parent's tracing context so the child's subagent.run span
+    # nests under the parent run instead of starting a detached trace. Worker
+    # threads are short-lived and share one parent context, so a detach isn't
+    # needed here.
+    try:
+        from agent import observability as _obs
+        _obs.attach_context(_otel_ctx)
+    except Exception:
+        pass
     child_start = time.monotonic()
 
     # Get the progress callback from the child agent
@@ -494,13 +504,21 @@ def delegate_task(
 
     timeout = cfg.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)
 
+    # Capture tracing context in the parent thread to re-attach inside each child
+    # worker thread (so subagent.run spans nest under the parent run).
+    try:
+        from agent import observability as _obs
+        _otel_ctx = _obs.capture_context()
+    except Exception:
+        _otel_ctx = None
+
     if n_tasks == 1:
         # Single task -- run in thread with timeout
         _i, _t, child = children[0]
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
                 _run_single_child, task_index=0, goal=_t["goal"],
-                child=child, parent_agent=parent_agent,
+                child=child, parent_agent=parent_agent, _otel_ctx=_otel_ctx,
             )
             try:
                 result = future.result(timeout=timeout)
@@ -531,6 +549,7 @@ def delegate_task(
                     goal=t["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    _otel_ctx=_otel_ctx,
                 )
                 futures[future] = i
 
