@@ -429,6 +429,7 @@ def execute_code(
         from agent import observability as _obs
         _obs.info(
             "code_execution.code",
+            tags=["tool", "code-exec"],
             code=code,
             code_chars=len(code),
             tools=",".join(sorted(sandbox_tools)),
@@ -705,6 +706,7 @@ def execute_code(
             from agent import observability as _obs
             _obs.info(
                 "code_execution.result",
+                tags=["tool", "code-exec"],
                 status=result["status"],
                 duration_seconds=result["duration_seconds"],
                 tool_calls_made=result["tool_calls_made"],
@@ -729,6 +731,7 @@ def execute_code(
             from agent import observability as _obs
             _obs.info(
                 "code_execution.result",
+                tags=["tool", "code-exec"],
                 status="error",
                 duration_seconds=duration,
                 tool_calls_made=tool_call_counter[0],

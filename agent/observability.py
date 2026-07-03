@@ -59,12 +59,18 @@ def configure_observability(service_name: str = "hermes-agent",
         logfire.instrument_openai()    # <-- the correct hook for Hermes' OpenRouter path
         # Each extra instrumentation is best-effort: one missing package must not
         # disable the whole observability layer.
-        for name, fn in (("httpx", getattr(logfire, "instrument_httpx", None)),
-                         ("pydantic", getattr(logfire, "instrument_pydantic", None))):
+        # pydantic record="failure": success-path spans (one per validate call,
+        # incl. the OpenAI SDK's internals) flooded every trace with hundreds of
+        # "nullable validate_python succeeded" rows; only failed validations
+        # (e.g. an LLM response that doesn't parse) are worth a span.
+        for name, fn, kwargs in (
+                ("httpx", getattr(logfire, "instrument_httpx", None), {}),
+                ("pydantic", getattr(logfire, "instrument_pydantic", None),
+                 {"record": "failure"})):
             if fn is None:
                 continue
             try:
-                fn()   # httpx -> every outbound API call; pydantic -> validation
+                fn(**kwargs)   # httpx -> every outbound API call
             except Exception as e:
                 logger.debug("logfire.instrument_%s skipped: %s", name, e)
         _logfire = logfire
@@ -146,22 +152,26 @@ def _guarded(cm):
         raise exc
 
 
-def span(name: str, **attributes: Any):
+def span(name: str, tags: list | None = None, **attributes: Any):
     """Open a Logfire span, or a no-op context manager when disabled. Hardened so
-    a Logfire failure can never break the agent (logging is best-effort)."""
+    a Logfire failure can never break the agent (logging is best-effort).
+
+    tags render as colored chips next to the message in the Logfire live view
+    (and are queryable via ``tags @> ['…']``) — keep them low-cardinality:
+    a kind ("agent"/"tool"/"report"/"llm") plus one specific ("phase:research")."""
     if ENABLED and _logfire is not None:
         try:
-            cm = _logfire.span(name, **attributes)
+            cm = _logfire.span(name, _tags=tags, **attributes)
         except Exception:
             return nullcontext()
         return _guarded(cm)
     return nullcontext()
 
 
-def info(message: str, **attributes: Any) -> None:
+def info(message: str, tags: list | None = None, **attributes: Any) -> None:
     if ENABLED and _logfire is not None:
         try:
-            _logfire.info(message, **attributes)
+            _logfire.info(message, _tags=tags, **attributes)
         except Exception:
             pass
 
@@ -194,8 +204,9 @@ def instrument_run(func):
         # so child agent runs are identifiable and their cost/latency visible.
         depth = getattr(self, "_delegate_depth", 0)
         attrs["delegate_depth"] = depth
-        name = "subagent.run" if depth and depth > 0 else "hermes.run"
-        with span(name, **attrs):
+        is_sub = bool(depth and depth > 0)
+        name = "subagent.run" if is_sub else "hermes.run"
+        with span(name, tags=["agent", "subagent" if is_sub else "chat"], **attrs):
             try:
                 return func(self, *args, **kwargs)
             finally:
@@ -211,7 +222,8 @@ def instrument_tool(func):
             return func(*args, **kwargs)
         name = kwargs.get("function_name") or (args[0] if args else "unknown")
         fargs = kwargs.get("function_args") or (args[1] if len(args) > 1 else None)
-        with span(f"tool.{name}", tool=str(name), args_preview=_preview(fargs)):
+        with span(f"tool.{name}", tags=["tool", str(name)],
+                  tool=str(name), args_preview=_preview(fargs)):
             return func(*args, **kwargs)
     return wrapper
 
@@ -237,13 +249,16 @@ def instrument_report(span_name: str):
                 html = payload.get("report_html") or payload.get("html")
                 if isinstance(html, str):
                     attrs["input_html_chars"] = len(html)
-            with span(span_name, **attrs):
+            # "report.chat_v2" -> chips ["report", "chat_v2"]
+            report_tags = ["report"] + span_name.split(".")[1:2]
+            with span(span_name, tags=report_tags, **attrs):
                 try:
                     res = await func(idarg, payload, *a, **k)
                     if isinstance(res, dict):
                         out = res.get("html") or res.get("report_html")
                         if isinstance(out, str):
-                            info(f"{span_name}.result", output_html_chars=len(out))
+                            info(f"{span_name}.result", tags=["report", "result"],
+                                 output_html_chars=len(out))
                     return res
                 finally:
                     flush()

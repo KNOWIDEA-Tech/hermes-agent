@@ -6103,6 +6103,7 @@ class AIAgent:
                         _cost_usd = _or_cost if _or_cost is not None else cost_result.amount_usd
                         obs.info(
                             "llm_usage",
+                            tags=["llm", "cost"],
                             model=self.model,
                             response_model=getattr(response, "model", None),
                             input_tokens=canonical_usage.input_tokens,
