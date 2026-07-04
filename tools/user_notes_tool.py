@@ -361,32 +361,35 @@ _MAX_MEMORY_CHARS = 10000
 
 
 def _get_message_id() -> Optional[str]:
-    """Current chat turn's assistant message id (provenance/idempotency only)."""
+    """Current chat turn's assistant message id (provenance/idempotency only).
+
+    CONTEXTVAR ONLY — deliberately no os.environ fallback. This tool runs
+    in-process on the agent's executor thread, where both entry points
+    (_run_agent and _retry_agent in unified_chat) set the contextvar. A process
+    env var is shared across concurrent requests and could stamp another turn's
+    message id on this user's provenance rows.
+    """
     try:
         from src.utils.user_context import get_message_id
 
-        message_id = get_message_id()
-        if message_id:
-            return message_id
+        return get_message_id() or None
     except ImportError:
-        pass
-    return os.environ.get("HERMES_MESSAGE_ID") or None
+        return None
 
 
 def _get_memory_enabled() -> Optional[bool]:
-    """Per-chat auto-memory switch. False = writes disabled; None = unknown (on)."""
+    """Per-chat auto-memory switch. False = writes disabled; None = unknown (on).
+
+    CONTEXTVAR ONLY — see _get_message_id. An env fallback here could let a
+    concurrent request's ON leak into a chat whose user explicitly turned
+    memory OFF.
+    """
     try:
         from src.utils.user_context import get_memory_enabled
 
-        enabled = get_memory_enabled()
-        if enabled is not None:
-            return enabled
+        return get_memory_enabled()
     except ImportError:
-        pass
-    env = os.environ.get("HERMES_MEMORY_ENABLED")
-    if env is None:
         return None
-    return env != "0"
 
 
 def _normalize_bullet(value: str) -> str:
