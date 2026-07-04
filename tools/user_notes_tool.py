@@ -1,14 +1,18 @@
-"""User Notes Tool — read-only access to the user's personal notes vault.
+"""User Notes Tool — access to the user's personal notes vault.
 
-Provides three tools for the agent to discover and read user-authored notes
-stored in Supabase (app.user_notes). The agent CANNOT create, update, or
-delete notes — they are strictly read-only context.
+Provides three READ tools for the agent to discover and read user-authored
+notes stored in Supabase (app.user_notes), plus ONE narrowly-scoped write tool
+(`update_memory`) that can ONLY touch the auto-maintained project "AI Memory"
+note (is_agent_memory=true, memory_kind='project'). The agent still CANNOT
+create, update, or delete any user-authored note.
 
 Security:
 - user_id is NEVER accepted as a tool parameter
 - Primary source: contextvar (coroutine-isolated, safe for concurrent requests)
 - Fallback: os.environ["HERMES_USER_ID"] (for subprocess sandbox compatibility)
 - Database RLS enforces filtering via session variable as defense-in-depth
+- update_memory writes are additive-or-snapshotted: every edit records an
+  app.agent_memory_edits provenance row so the web app can undo it.
 """
 
 import json
@@ -340,6 +344,278 @@ def search_user_notes(query: str, **kwargs) -> str:
 
 
 # ---------------------------------------------------------------------------
+# update_memory — the ONLY write tool. Scoped strictly to the project's
+# auto-maintained "AI Memory" note; mirrors the web app's
+# lib/services/memory/agent-memory-service.ts semantics (dedup, lazy create,
+# snapshot-before-replace, agent_memory_edits provenance for undo).
+# ---------------------------------------------------------------------------
+
+_MEMORY_NODE_PATH = "AI Memory"
+_MEMORY_NODE_DESCRIPTION = (
+    "Facts the assistant has learned about this project (auto-maintained)."
+)
+_EDITS_TABLE = "agent_memory_edits"
+_MAX_MEMORY_BULLET_CHARS = 300
+_MAX_APPEND_BULLETS = 5
+_MAX_MEMORY_CHARS = 10000
+
+
+def _get_message_id() -> Optional[str]:
+    """Current chat turn's assistant message id (provenance/idempotency only)."""
+    try:
+        from src.utils.user_context import get_message_id
+
+        message_id = get_message_id()
+        if message_id:
+            return message_id
+    except ImportError:
+        pass
+    return os.environ.get("HERMES_MESSAGE_ID") or None
+
+
+def _get_memory_enabled() -> Optional[bool]:
+    """Per-chat auto-memory switch. False = writes disabled; None = unknown (on)."""
+    try:
+        from src.utils.user_context import get_memory_enabled
+
+        enabled = get_memory_enabled()
+        if enabled is not None:
+            return enabled
+    except ImportError:
+        pass
+    env = os.environ.get("HERMES_MEMORY_ENABLED")
+    if env is None:
+        return None
+    return env != "0"
+
+
+def _normalize_bullet(value: str) -> str:
+    """Case/punctuation-insensitive key for dedup (mirror of the TS normalize)."""
+    import re as _re
+
+    return _re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _bullets_from_content(content: Optional[str]) -> list:
+    """Split note markdown back into bullet strings (mirror of the TS helper)."""
+    import re as _re
+
+    out = []
+    for line in (content or "").split("\n"):
+        b = _re.sub(r"^[-*]\s?", "", line).strip()
+        if b:
+            out.append(b)
+    return out
+
+
+def _bullets_from_input(content: str) -> list:
+    """Coerce tool-arg content into normalized, capped bullet lines."""
+    return [b[:_MAX_MEMORY_BULLET_CHARS] for b in _bullets_from_content(content)]
+
+
+def update_memory(operation: str, content: str, **kwargs) -> str:
+    """Append to / replace the project's auto-maintained AI Memory note."""
+    user_id = _get_user_id()
+    logger.info(
+        "[Memory][tool] update_memory called: op=%s content_len=%d user=%s",
+        operation,
+        len(content or ""),
+        user_id,
+    )
+    if not user_id:
+        logger.warning("[Memory][tool] rejected: no user context")
+        return json.dumps({"error": "User context not available"}, ensure_ascii=False)
+
+    project_id = _get_active_project_id()
+    if not project_id:
+        logger.info("[Memory][tool] rejected: no project selected (user=%s)", user_id)
+        return json.dumps(
+            {"error": "No project selected — project memory is unavailable for this chat."},
+            ensure_ascii=False,
+        )
+
+    if operation not in ("append", "replace"):
+        logger.info("[Memory][tool] rejected: bad operation '%s' (user=%s)", operation, user_id)
+        return json.dumps(
+            {"error": "operation must be 'append' or 'replace'"}, ensure_ascii=False
+        )
+    new_bullets = _bullets_from_input(content or "")
+    if not new_bullets:
+        logger.info("[Memory][tool] rejected: empty content (user=%s)", user_id)
+        return json.dumps({"error": "content must contain at least one fact"}, ensure_ascii=False)
+
+    sb = _get_supabase()
+    if not sb:
+        return json.dumps({"error": "Notes service unavailable"}, ensure_ascii=False)
+
+    # Respect the per-chat auto-memory toggle (chat header switch, threaded via
+    # contextvar/env from the request payload).
+    if _get_memory_enabled() is False:
+        logger.info("[Memory][tool] rejected: per-chat memory toggle OFF (user=%s)", user_id)
+        return json.dumps(
+            {"error": "Memory is turned OFF for this chat. Do not attempt to save memory."},
+            ensure_ascii=False,
+        )
+
+    try:
+        _set_rls_context(sb, user_id)
+
+        # Locate the (single) AI Memory node for this project.
+        node_res = (
+            sb.schema(_SCHEMA)
+            .table(_TABLE)
+            .select("id, path, content")
+            .eq("user_id", user_id)
+            .eq("project_id", project_id)
+            .eq("is_agent_memory", True)
+            .eq("memory_kind", "project")
+            .limit(1)
+            .execute()
+        )
+        node = (node_res.data or [None])[0]
+        existing_bullets = _bullets_from_content(node.get("content") if node else None)
+
+        if operation == "append":
+            seen = {_normalize_bullet(b) for b in existing_bullets}
+            accepted = []
+            for b in new_bullets:
+                if len(accepted) >= _MAX_APPEND_BULLETS:
+                    break
+                key = _normalize_bullet(b)
+                if not key or key in seen:
+                    continue
+                accepted.append(b)
+                seen.add(key)
+            if not accepted:
+                logger.info("[Memory][tool] no-op: all facts already in memory (user=%s)", user_id)
+                return json.dumps(
+                    {"result": "no_new_facts", "message": "All facts are already in memory."},
+                    ensure_ascii=False,
+                )
+            final_bullets = existing_bullets + accepted
+            added_lines = accepted
+            prev_content = None
+        else:  # replace
+            # Shrink-guard: a full rewrite must not silently drop most of the
+            # memory. Teach the model in-loop instead of accepting the loss.
+            if len(existing_bullets) >= 4 and len(new_bullets) < len(existing_bullets) / 2:
+                logger.info(
+                    "[Memory][tool] rejected: shrink-guard (%d existing -> %d incoming, user=%s)",
+                    len(existing_bullets),
+                    len(new_bullets),
+                    user_id,
+                )
+                return json.dumps(
+                    {
+                        "error": (
+                            f"replace must contain the COMPLETE updated memory. Memory has "
+                            f"{len(existing_bullets)} facts but you sent {len(new_bullets)}. "
+                            "Include every retained fact, or use operation='append' to add."
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            final_bullets = new_bullets
+            added_lines = new_bullets
+            prev_content = node.get("content") if node else None
+
+        next_content = "\n".join(f"- {b}" for b in final_bullets)
+        if len(next_content) > _MAX_MEMORY_CHARS:
+            logger.info(
+                "[Memory][tool] rejected: over cap (%d > %d chars, user=%s)",
+                len(next_content),
+                _MAX_MEMORY_CHARS,
+                user_id,
+            )
+            return json.dumps(
+                {
+                    "error": (
+                        f"Memory would exceed {_MAX_MEMORY_CHARS} chars. Use operation='replace' "
+                        "with a consolidated, shorter set of facts."
+                    )
+                },
+                ensure_ascii=False,
+            )
+
+        if node:
+            sb.schema(_SCHEMA).table(_TABLE).update({"content": next_content}).eq(
+                "id", node["id"]
+            ).eq("user_id", user_id).execute()
+            note_id = node["id"]
+        else:
+            # Lazy create on the first fact for this project.
+            ins = (
+                sb.schema(_SCHEMA)
+                .table(_TABLE)
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "project_id": project_id,
+                        "path": _MEMORY_NODE_PATH,
+                        "content": next_content,
+                        "description": _MEMORY_NODE_DESCRIPTION,
+                        "is_important": False,
+                        "is_company_context": False,
+                        "is_attached": False,
+                        "is_agent_memory": True,
+                        "memory_kind": "project",
+                    }
+                )
+                .execute()
+            )
+            note_id = (ins.data or [{}])[0].get("id")
+            if not note_id:
+                return json.dumps({"error": "Failed to create memory note"}, ensure_ascii=False)
+
+        # Provenance row → powers the web app's toast + undo (best-effort).
+        edit_id = None
+        try:
+            edit_res = (
+                sb.schema(_SCHEMA)
+                .table(_EDITS_TABLE)
+                .insert(
+                    {
+                        "user_id": user_id,
+                        "note_id": note_id,
+                        "message_id": _get_message_id(),
+                        "op": operation,
+                        "added_lines": added_lines,
+                        "prev_content": prev_content,
+                    }
+                )
+                .execute()
+            )
+            edit_id = (edit_res.data or [{}])[0].get("id")
+        except Exception as edit_err:
+            logger.warning("[user_notes] update_memory: provenance write failed: %s", edit_err)
+
+        logger.info(
+            "[Memory][tool] wrote: op=%s facts=%d user=%s project=%s note=%s edit=%s",
+            operation,
+            len(added_lines),
+            user_id,
+            project_id,
+            note_id,
+            edit_id,
+        )
+        return json.dumps(
+            {
+                "result": "ok",
+                "operation": operation,
+                "note_id": note_id,
+                "edit_id": edit_id,
+                "facts_written": len(added_lines),
+                "memory_size_bullets": len(final_bullets),
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception as e:
+        logger.error("[user_notes] update_memory failed for user %s: %s", user_id, e)
+        return json.dumps({"error": f"Failed to update memory: {e}"}, ensure_ascii=False)
+
+
+# ---------------------------------------------------------------------------
 # Availability check
 # ---------------------------------------------------------------------------
 
@@ -391,6 +667,40 @@ READ_USER_NOTE_SCHEMA: Dict[str, Any] = {
             },
         },
         "required": [],
+    },
+}
+
+UPDATE_MEMORY_SCHEMA: Dict[str, Any] = {
+    "name": "update_memory",
+    "description": (
+        "Update the project's auto-maintained 'AI Memory' note — durable, reusable facts "
+        "about THIS project worth remembering for future conversations (constraints, "
+        "metric/term definitions, naming conventions, standing preferences, data sources, "
+        "scope decisions). Capture ANY such durable fact; if the user repeats or insists on "
+        "something, ALWAYS capture it. Do NOT save one-off request parameters, transient "
+        "values, or small talk. The current memory is shown in your context under "
+        "'Project Memory (AI-maintained)'. operation='append' adds new facts not already in "
+        "memory; operation='replace' rewrites the WHOLE memory (content must be the complete "
+        "updated set of facts — use it to correct, dedupe, or consolidate). The user sees "
+        "every update and can undo it."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "operation": {
+                "type": "string",
+                "enum": ["append", "replace"],
+                "description": "'append' = add new fact(s); 'replace' = rewrite the complete memory",
+            },
+            "content": {
+                "type": "string",
+                "description": (
+                    "The fact(s), one per line as short factual sentences. For 'replace' this "
+                    "must be the ENTIRE updated memory, not just the changes."
+                ),
+            },
+        },
+        "required": ["operation", "content"],
     },
 }
 
@@ -451,4 +761,17 @@ registry.register(
     ),
     check_fn=_check_user_notes_requirements,
     emoji="🔍",
+)
+
+registry.register(
+    name="update_memory",
+    toolset="user_notes",
+    schema=UPDATE_MEMORY_SCHEMA,
+    handler=lambda args, **kw: update_memory(
+        operation=args.get("operation", ""),
+        content=args.get("content", ""),
+        **kw,
+    ),
+    check_fn=_check_user_notes_requirements,
+    emoji="🧠",
 )
