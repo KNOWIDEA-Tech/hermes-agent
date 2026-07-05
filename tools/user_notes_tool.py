@@ -75,6 +75,16 @@ def _get_active_project_id() -> Optional[str]:
     return os.environ.get("HERMES_ACTIVE_PROJECT_ID")
 
 
+def _exclude_detached_memory(query):
+    """Hide the AI-maintained memory note from the read tools when this chat has
+    memory detached (per-chat toggle OFF). Detached must mean unreachable by ANY
+    path — not just absent from the injected context — otherwise the model could
+    still list/search/read the note as if it were an ordinary note."""
+    if _get_memory_enabled() is False:
+        return query.eq("is_agent_memory", False)
+    return query
+
+
 def _get_supabase():
     """Return a Supabase client using service role credentials."""
     from supabase import create_client
@@ -140,6 +150,7 @@ def list_user_notes(**kwargs) -> str:
             .select("id, path, description, project_id, created_at, updated_at")
             .eq("user_id", user_id)
         )
+        query = _exclude_detached_memory(query)
         if active_project_id is not None:
             query = query.eq("project_id", active_project_id)
             logger.info(
@@ -194,6 +205,7 @@ def read_user_note(path: str, note_id: Optional[str] = None, **kwargs) -> str:
                 .eq("user_id", user_id)
                 .eq("id", nid)
             )
+            query = _exclude_detached_memory(query)
             if active_project_id is not None:
                 query = query.eq("project_id", active_project_id)
             result = query.limit(1).execute()
@@ -226,6 +238,7 @@ def read_user_note(path: str, note_id: Optional[str] = None, **kwargs) -> str:
             .eq("user_id", user_id)
             .eq("path", path.strip())
         )
+        query = _exclude_detached_memory(query)
         if active_project_id is not None:
             query = query.eq("project_id", active_project_id)
         result = query.execute()
@@ -315,6 +328,7 @@ def search_user_notes(query: str, **kwargs) -> str:
             .eq("user_id", user_id)
             .text_search("fts", ts_query, options={"type": "websearch"})
         )
+        search_query = _exclude_detached_memory(search_query)
         if active_project_id is not None:
             search_query = search_query.eq("project_id", active_project_id)
         result = search_query.limit(20).execute()
@@ -356,7 +370,7 @@ _MEMORY_NODE_DESCRIPTION = (
 )
 _EDITS_TABLE = "agent_memory_edits"
 _MAX_MEMORY_BULLET_CHARS = 300
-_MAX_APPEND_BULLETS = 5
+_MAX_APPEND_BULLETS = 3
 _MAX_MEMORY_CHARS = 10000
 
 
@@ -393,10 +407,13 @@ def _get_memory_enabled() -> Optional[bool]:
 
 
 def _normalize_bullet(value: str) -> str:
-    """Case/punctuation-insensitive key for dedup (mirror of the TS normalize)."""
+    """Case/punctuation-insensitive key for dedup (mirror of the TS normalize).
+    A leading "the " is dropped so trivial rephrasings ("The user wants X" vs
+    "User wants X") dedup to the same key."""
     import re as _re
 
-    return _re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    normalized = _re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    return _re.sub(r"^the\s+", "", normalized)
 
 
 def _bullets_from_content(content: Optional[str]) -> list:
@@ -411,9 +428,49 @@ def _bullets_from_content(content: Optional[str]) -> list:
     return out
 
 
+# Placeholder outputs an LLM emits to mean "no facts" — never save as bullets
+# (a "output NOTHING" prompt once produced a literal "NOTHING" memory bullet).
+_NON_FACT_SENTINELS = {
+    "nothing", "none", "n/a", "na", "no facts", "no new facts",
+    "nothing to save", "nothing durable", "no durable facts", "empty", "null",
+}
+
+
+def _is_non_fact(bullet: str) -> bool:
+    import re as _re
+
+    normalized = _re.sub(r"[^a-z/ ]", "", bullet.lower())
+    normalized = _re.sub(r"\s+", " ", normalized).strip()
+    return normalized in _NON_FACT_SENTINELS
+
+
+def _is_invalid_memory_shape(bullet: str) -> bool:
+    """Memory bullets must be DECLARATIVE facts about the user — never questions,
+    assistant-voice sentences, option lists, or placeholder phrases (observed
+    live: an assistant clarify reply and '(empty response)' saved as memory)."""
+    import re as _re
+
+    return bool(
+        _re.search(r"\?\s*$", bullet)
+        or _re.match(r"^(i|i'm|i've|i'll|i'd)\b", bullet, _re.IGNORECASE)
+        or _re.match(r"^(could|would|can|will|do|did) you\b", bullet, _re.IGNORECASE)
+        or _re.match(r"^please\b", bullet, _re.IGNORECASE)
+        or _re.match(r"^\d+[.)]\s", bullet)
+        or _re.match(
+            r"^\(?\s*(?:empty|no)\s+(?:response|reply|output|content|facts?)\s*\)?\.?$",
+            bullet,
+            _re.IGNORECASE,
+        )
+    )
+
+
 def _bullets_from_input(content: str) -> list:
     """Coerce tool-arg content into normalized, capped bullet lines."""
-    return [b[:_MAX_MEMORY_BULLET_CHARS] for b in _bullets_from_content(content)]
+    return [
+        b[:_MAX_MEMORY_BULLET_CHARS]
+        for b in _bullets_from_content(content)
+        if not _is_non_fact(b) and not _is_invalid_memory_shape(b)
+    ]
 
 
 def update_memory(operation: str, content: str, **kwargs) -> str:
@@ -676,16 +733,23 @@ READ_USER_NOTE_SCHEMA: Dict[str, Any] = {
 UPDATE_MEMORY_SCHEMA: Dict[str, Any] = {
     "name": "update_memory",
     "description": (
-        "Update the project's auto-maintained 'AI Memory' note — durable, reusable facts "
-        "about THIS project worth remembering for future conversations (constraints, "
-        "metric/term definitions, naming conventions, standing preferences, data sources, "
-        "scope decisions). Capture ANY such durable fact; if the user repeats or insists on "
-        "something, ALWAYS capture it. Do NOT save one-off request parameters, transient "
-        "values, or small talk. The current memory is shown in your context under "
-        "'Project Memory (AI-maintained)'. operation='append' adds new facts not already in "
-        "memory; operation='replace' rewrites the WHOLE memory (content must be the complete "
-        "updated set of facts — use it to correct, dedupe, or consolidate). The user sees "
-        "every update and can undo it."
+        "Update the project's auto-maintained 'AI Memory' note — ONLY facts that would "
+        "change how you answer a DIFFERENT question in a FUTURE conversation: standing "
+        "preferences, explicit corrections, metric/term definitions, hard constraints, "
+        "data-source facts, or explicit asks to remember. If the user repeats or insists "
+        "on something, ALWAYS capture it. Do NOT save the topic of the current "
+        "conversation, what the user is working on or asking about right now, their "
+        "current goals/tasks, one-off request parameters, transient values, or small "
+        "talk — conversation content is not memory. Most turns need NO save, and no save "
+        "means DO NOT CALL THIS TOOL — never call it with placeholder content like "
+        "'nothing' or 'none'; only call when you have a real fact to write. The current "
+        "memory is shown in your context under 'Project Memory (AI-maintained)'. Never "
+        "save a fact already in that memory (even reworded), already stated in the "
+        "Company Context or the user's notes, or obvious from the project itself — "
+        "memory is only for NEW information your context does not already contain. "
+        "operation='append' adds new facts not already in memory; operation='replace' "
+        "rewrites the WHOLE memory (content must be the complete updated set — use it to "
+        "correct, dedupe, or consolidate). The user sees every update and can undo it."
     ),
     "parameters": {
         "type": "object",
