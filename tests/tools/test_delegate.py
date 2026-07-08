@@ -599,6 +599,9 @@ class TestDelegationCredentialResolution(unittest.TestCase):
             "base_url": "http://localhost:1234/v1",
         }
         with patch.dict(os.environ, {"OPENROUTER_API_KEY": "env-openrouter-key"}, clear=False):
+            # A direct endpoint must not fall back to OPENROUTER; ensure no
+            # ambient OPENAI_API_KEY (e.g. the CI dummy) masks the raise.
+            os.environ.pop("OPENAI_API_KEY", None)
             with self.assertRaises(ValueError) as ctx:
                 _resolve_delegation_credentials(cfg, parent)
         self.assertIn("OPENAI_API_KEY", str(ctx.exception))
