@@ -370,7 +370,10 @@ _MEMORY_NODE_DESCRIPTION = (
 )
 _EDITS_TABLE = "agent_memory_edits"
 _MAX_MEMORY_BULLET_CHARS = 300
-_MAX_APPEND_BULLETS = 3
+# Generous per-turn cap — the real ceiling is _MAX_MEMORY_CHARS. A tight cap
+# silently truncated multi-fact turns. Mirror: MAX_FACTS_PER_TURN in the web app
+# (lib/services/memory/agent-memory-service.ts).
+_MAX_APPEND_BULLETS = 6
 _MAX_MEMORY_CHARS = 10000
 
 
@@ -464,13 +467,130 @@ def _is_invalid_memory_shape(bullet: str) -> bool:
     )
 
 
+# Rewrite a first-person fact into the third-person shape memory requires, so a
+# genuine fact isn't dropped by the assistant-voice guard in
+# _is_invalid_memory_shape ("I'm the CFO" -> "User is the CFO"). Conservative:
+# only high-signal preference/identity openers are converted. Mirror of the TS
+# normalizeFirstPerson (lib/services/memory/agent-memory-service.ts) — keep in
+# sync (parity suite in tests/test_output_contracts.py).
+_FIRST_PERSON_REWRITES = [
+    (r"^i['’]m\s+", "User is "),
+    (r"^i\s+am\s+", "User is "),
+    (r"^i['’]ve\s+", "User has "),
+    (r"^i\s+have\s+", "User has "),
+    (r"^i['’]ll\s+", "User will "),
+    (r"^i\s+will\s+", "User will "),
+    (r"^i['’]d\s+like\s+", "User wants "),
+    (r"^i\s+would\s+like\s+", "User wants "),
+    (r"^i\s+want\s+", "User wants "),
+    (r"^i\s+need\s+", "User needs "),
+    (r"^i\s+prefer\s+", "User prefers "),
+    (r"^i\s+like\s+", "User likes "),
+    (r"^i\s+do\s*n['’]?t\s+want\s+", "User does not want "),
+    (r"^i\s+do\s*n['’]?t\s+like\s+", "User does not like "),
+    (r"^i\s+use\s+", "User uses "),
+    (r"^my\s+name\s+is\s+", "User's name is "),
+    (r"^my\s+", "User's "),
+]
+
+
+def _normalize_first_person(value: str) -> str:
+    import re as _re
+
+    for pat, repl in _FIRST_PERSON_REWRITES:
+        if _re.match(pat, value, _re.IGNORECASE):
+            return _re.sub(pat, repl, value, count=1, flags=_re.IGNORECASE)
+    return value
+
+
 def _bullets_from_input(content: str) -> list:
-    """Coerce tool-arg content into normalized, capped bullet lines."""
-    return [
-        b[:_MAX_MEMORY_BULLET_CHARS]
-        for b in _bullets_from_content(content)
-        if not _is_non_fact(b) and not _is_invalid_memory_shape(b)
-    ]
+    """Coerce tool-arg content into normalized, capped bullet lines. First-person
+    facts are rescued into third person BEFORE the shape filter, not dropped."""
+    out = []
+    for raw in _bullets_from_content(content):
+        b = _normalize_first_person(raw)
+        if _is_non_fact(b) or _is_invalid_memory_shape(b):
+            continue
+        out.append(b[:_MAX_MEMORY_BULLET_CHARS])
+    return out
+
+
+# Shared OpenRouter chat-completions endpoint for the cheap classifier call.
+_OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+
+def _semantic_novel_bullets(reference: list, candidates: list) -> list:
+    """Return the subset of `candidates` that add genuinely NEW info not already
+    covered by `reference` (same meaning in different words = already covered).
+    One cheap classifier call — the lexical _normalize_bullet dedup only catches
+    near-identical strings, so this is what stops paraphrase duplicates from
+    piling up. Mirror of the TS semanticNovelBullets.
+
+    FAIL-OPEN: on any error, a disabled flag, or empty input returns `candidates`
+    unchanged (a rare paraphrase dup is far better than dropping a real fact; the
+    lexical dedup already removed exact dups). Toggle off with
+    MEMORY_SEMANTIC_DEDUP=0.
+    """
+    if os.getenv("MEMORY_SEMANTIC_DEDUP") == "0":
+        return candidates
+    if not candidates or not reference:
+        return candidates
+    try:
+        import re as _re
+
+        import httpx
+
+        from src.constants.models import CHAT_CLASSIFIER_MODEL
+
+        api_key = os.getenv("OPENROUTER_API_KEY", "")
+        if not api_key:
+            return candidates
+        user_content = (
+            "EXISTING memory facts:\n"
+            + "\n".join(f"- {b}" for b in reference)
+            + "\n\nCANDIDATE new facts (indexed):\n"
+            + "\n".join(f"[{i}] {b}" for i, b in enumerate(candidates))
+            + "\n\nReturn a JSON array of the [index] numbers of CANDIDATES that add "
+            "genuinely NEW information NOT already stated by any EXISTING fact. "
+            "Return [] if all candidates are already covered. Output ONLY the JSON array."
+        )
+        payload = {
+            "model": CHAT_CLASSIFIER_MODEL,
+            "max_tokens": 200,
+            "temperature": 0,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You deduplicate an AI assistant's long-term memory. Be strict: "
+                        "a candidate that restates an existing fact in different words is NOT new."
+                    ),
+                },
+                {"role": "user", "content": user_content},
+            ],
+        }
+        with httpx.Client(timeout=6) as client:
+            resp = client.post(
+                _OPENROUTER_CHAT_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+            )
+            resp.raise_for_status()
+            reply = (resp.json()["choices"][0]["message"]["content"] or "").strip()
+        m = _re.search(r"\[[\s\S]*\]", reply)
+        if not m:
+            return candidates
+        idxs = json.loads(m.group(0))
+        if not isinstance(idxs, list):
+            return candidates
+        keep = {n for n in idxs if isinstance(n, int) and not isinstance(n, bool)}
+        return [b for i, b in enumerate(candidates) if i in keep]
+    except Exception as e:  # noqa: BLE001 — dedup must never break a save
+        logger.warning("[Memory][tool] semantic dedup failed — fail-open: %s", e)
+        return candidates
 
 
 def update_memory(operation: str, content: str, **kwargs) -> str:
@@ -546,6 +666,10 @@ def update_memory(operation: str, content: str, **kwargs) -> str:
                     continue
                 accepted.append(b)
                 seen.add(key)
+            # Semantic dedup: drop paraphrases of facts already in memory that the
+            # lexical key missed (fail-open — see _semantic_novel_bullets).
+            if accepted and existing_bullets:
+                accepted = _semantic_novel_bullets(existing_bullets, accepted)
             if not accepted:
                 logger.info("[Memory][tool] no-op: all facts already in memory (user=%s)", user_id)
                 return json.dumps(
