@@ -740,7 +740,20 @@ UPDATE_MEMORY_SCHEMA: Dict[str, Any] = {
         "on something, ALWAYS capture it. Do NOT save the topic of the current "
         "conversation, what the user is working on or asking about right now, their "
         "current goals/tasks, one-off request parameters, transient values, or small "
-        "talk — conversation content is not memory. Most turns need NO save, and no save "
+        "talk — conversation content is not memory. "
+        # Contrastive examples — mirror of MEMORY_CONTRASTIVE_EXAMPLES in the web app
+        # (lib/services/memory/memory-policy.ts). Naming the exact leak modes stops
+        # a one-off task instruction being saved as if it were a durable preference.
+        "Examples — do NOT save for: a question ('how does Q3 revenue compare by "
+        "region?'), or a one-off request scoped to the current task ('make this chart "
+        "blue', 'add the total row and include Q4', 'break revenue down by region for "
+        "this analysis') — transient even when phrased as commands with "
+        "'add/include/show'. DO save for a fact that outlives this task: a standing "
+        "preference ('always show revenue in millions'), a business definition/metric "
+        "('fiscal year ends in March'), a hard constraint, or an explicit correction "
+        "('actually, churn should exclude trials'). When unsure whether something is "
+        "standing or one-off, do NOT save it. "
+        "Most turns need NO save, and no save "
         "means DO NOT CALL THIS TOOL — never call it with placeholder content like "
         "'nothing' or 'none'; only call when you have a real fact to write. The current "
         "memory is shown in your context under 'Project Memory (AI-maintained)'. Never "
