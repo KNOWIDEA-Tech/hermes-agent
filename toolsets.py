@@ -66,6 +66,8 @@ _HERMES_CORE_TOOLS = [
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # User notes (read-only access to user's personal notes vault)
     "list_user_notes", "read_user_note", "search_user_notes",
+    # Hierarchical memory retrieval (memory-chat route only; gated via check_fn)
+    "consult_memory",
 ]
 
 
@@ -213,6 +215,12 @@ TOOLSETS = {
     "user_notes": {
         "description": "Read-only access to the user's personal notes vault (preferences, context, instructions)",
         "tools": ["list_user_notes", "read_user_note", "search_user_notes"],
+        "includes": []
+    },
+
+    "memory_consult": {
+        "description": "On-demand hierarchical memory retrieval (Company/Team/Project notes) via a scoped sub-agent — available only on the memory-chat route",
+        "tools": ["consult_memory"],
         "includes": []
     },
 
