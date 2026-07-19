@@ -26,13 +26,44 @@ Security:
 """
 
 import json
-import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from tools.registry import registry
 
-logger = logging.getLogger(__name__)
+
+# Prefer the Hermes STRUCTURED logger so sub-agent activity renders in Modal the
+# same way the main agent does ([exec:id] + structured fields on stdout). Fall
+# back to a tiny shim over stdlib logging when the tool runs outside Hermes
+# (standalone hermes-agent), so logger.info("msg", key=val) never breaks.
+try:  # pragma: no cover - depends on runtime host
+    from src.utils.logger import get_logger as _get_logger
+
+    logger = _get_logger(__name__)
+except Exception:  # pragma: no cover
+    import logging as _logging
+
+    _std = _logging.getLogger(__name__)
+
+    class _LoggerShim:
+        @staticmethod
+        def _fmt(msg: str, kw: dict) -> str:
+            return f"{msg} - {kw}" if kw else msg
+
+        def info(self, msg: str, **kw: Any) -> None:
+            _std.info(self._fmt(msg, kw))
+
+        def warning(self, msg: str, **kw: Any) -> None:
+            _std.warning(self._fmt(msg, kw))
+
+        def error(self, msg: str, exc_info: bool = False, **kw: Any) -> None:
+            _std.error(self._fmt(msg, kw), exc_info=exc_info)
+
+        def exception(self, msg: str, **kw: Any) -> None:
+            _std.error(self._fmt(msg, kw), exc_info=True)
+
+    logger = _LoggerShim()
 
 _SCHEMA = "app"
 _TABLE = "user_notes"
@@ -182,18 +213,36 @@ def _parse_subagent_output(text: str) -> Dict[str, Any]:
 
 def consult_memory(query: str, **kwargs) -> str:
     """Retrieve + distill the user's hierarchical memory for a natural-language query."""
+    t0 = time.monotonic()
     q = (query or "").strip()
     if not q:
+        logger.warning("[consult_memory] rejected: empty query")
         return json.dumps({"error": "query is required"}, ensure_ascii=False)
 
     scope = _get_memory_context()
     if not isinstance(scope, dict):
+        logger.warning("[consult_memory] rejected: no memory scope on this turn")
         return json.dumps(
             {"error": "Memory is not available for this chat."}, ensure_ascii=False
         )
 
     allowed_note_ids = scope.get("allowed_note_ids") or []
+    model = _get_subagent_model()
+
+    # Lifecycle: sub-agent spun up. This is the line to grep in Modal to confirm
+    # a consult_memory call fired, with the scope it was bound to + the model.
+    logger.info(
+        "[consult_memory] sub-agent invoked",
+        query=q[:160],
+        root_node_id=scope.get("root_node_id"),
+        root_kind=scope.get("root_kind"),
+        scope_nodes=len(scope.get("scope_node_ids") or []),
+        allowed_notes=len(allowed_note_ids),
+        model=model,
+    )
+
     if not allowed_note_ids:
+        logger.info("[consult_memory] no team/project notes in scope — company-only reply")
         return json.dumps(
             {
                 "status": "ok",
@@ -207,16 +256,24 @@ def consult_memory(query: str, **kwargs) -> str:
 
     sb = _get_supabase()
     if not sb:
+        logger.error("[consult_memory] Supabase unavailable (missing SUPABASE_URL/KEY)")
         return json.dumps({"error": "Memory service unavailable"}, ensure_ascii=False)
 
     try:
         notes = _fetch_allowed_notes(sb, allowed_note_ids)
     except Exception as e:
-        logger.error("[consult_memory] note fetch failed: %s", e)
+        logger.exception("[consult_memory] note fetch failed", error=str(e))
         return json.dumps({"error": f"Failed to fetch memory: {e}"}, ensure_ascii=False)
 
     notes_block = _build_notes_block(notes)
+    logger.info(
+        "[consult_memory] notes fetched",
+        allowed=len(allowed_note_ids),
+        fetched=len(notes),
+        block_chars=len(notes_block),
+    )
     if not notes_block:
+        logger.warning("[consult_memory] in-scope notes have no readable content")
         return json.dumps(
             {"status": "ok", "summary": "(the in-scope notes have no readable content)"},
             ensure_ascii=False,
@@ -227,12 +284,17 @@ def consult_memory(query: str, **kwargs) -> str:
         f"NOTES ({len(notes)} in scope):\n{notes_block}"
     )
 
+    logger.info(
+        "[consult_memory] calling sub-agent LLM",
+        model=model,
+        prompt_chars=len(user_prompt),
+    )
     try:
         from agent.auxiliary_client import call_llm
 
         response = call_llm(
             provider="openrouter",
-            model=_get_subagent_model(),
+            model=model,
             messages=[
                 {"role": "system", "content": _SUBAGENT_SYSTEM},
                 {"role": "user", "content": user_prompt},
@@ -243,17 +305,24 @@ def consult_memory(query: str, **kwargs) -> str:
         )
         content = response.choices[0].message.content or ""
     except Exception as e:
-        logger.error("[consult_memory] sub-agent LLM call failed: %s", e)
+        logger.exception(
+            "[consult_memory] sub-agent LLM call failed",
+            model=model,
+            error=str(e),
+            elapsed_ms=int((time.monotonic() - t0) * 1000),
+        )
         return json.dumps(
             {"error": f"Memory sub-agent failed: {type(e).__name__}"}, ensure_ascii=False
         )
 
     parsed = _parse_subagent_output(content)
+    summary_text = parsed.get("summary") or parsed.get("question") or ""
     logger.info(
-        "[consult_memory] query=%r notes=%d status=%s",
-        q[:120],
-        len(notes),
-        parsed.get("status"),
+        "[consult_memory] sub-agent complete",
+        status=parsed.get("status"),
+        notes=len(notes),
+        summary_chars=len(summary_text),
+        elapsed_ms=int((time.monotonic() - t0) * 1000),
     )
     return json.dumps(parsed, ensure_ascii=False, default=str)
 
