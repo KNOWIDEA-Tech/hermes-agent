@@ -17,12 +17,17 @@ a natural-language query. This tool runs a scoped, single-shot "memory sub-agent
 
 Read-only v1: this tool never writes. The main agent may call it repeatedly.
 
-Security:
-- `allowed_note_ids` is the isolation boundary. It is computed server-side from
-  the org + the user-selected node subtree and forwarded via contextvar. The tool
-  ONLY ever fetches note bodies whose id is in that list, so retrieval can never
-  escape the selected branch or the org.
-- No user_id / node_id / note_id is ever accepted from the model.
+Security (defense-in-depth — TWO independent boundaries):
+- `allowed_note_ids` narrows retrieval to the user-selected subtree. It is computed
+  by the web app and forwarded via contextvar; the tool only ever fetches note
+  bodies whose id is in that list.
+- CROSS-ORG RE-SCOPE: the forwarded allow-list is CLIENT-influenced (the web route
+  authenticates the end user but the payload rides the request), so the tool does
+  NOT trust it for tenant isolation. The note fetch is additionally constrained to
+  `client_id = <the AUTHENTICATED user's org>`, derived server-side here from the
+  trusted user_id contextvar (never from the request body). A forged allow-list
+  carrying another org's note ids therefore matches zero rows.
+- No user_id / node_id / note_id / org is ever accepted from the model.
 """
 
 import json
@@ -95,12 +100,32 @@ def _get_memory_context() -> Optional[dict]:
         return None
 
 
+def _get_user_id() -> Optional[str]:
+    """The AUTHENTICATED user's id for this turn — the trust anchor for org scope.
+
+    Read from the coroutine-isolated contextvar that Hermes sets server-side from
+    resolve_user(auth_token, ...); env fallback for the subprocess sandbox. NEVER a
+    tool parameter and NEVER the request body — this is what lets us re-derive the
+    org and reject a forged allow-list.
+    """
+    try:
+        from src.utils.user_context import get_user_id
+
+        uid = get_user_id()
+        if uid:
+            return uid
+    except ImportError:
+        pass
+    return os.environ.get("HERMES_USER_ID") or None
+
+
 def _get_supabase():
     """Return a Supabase client using service-role credentials.
 
     Service role is used ON PURPOSE: memory notes may be authored by OTHER users
     in the org (company/team context), so per-user RLS must NOT be applied here.
-    The isolation boundary is `allowed_note_ids`, computed server-side.
+    Tenant isolation is enforced explicitly instead — every fetch is constrained to
+    the authenticated user's org (see `_resolve_user_org` + `_fetch_allowed_notes`).
     """
     from supabase import create_client
 
@@ -109,6 +134,32 @@ def _get_supabase():
     if not url or not key:
         return None
     return create_client(url, key)
+
+
+def _resolve_user_org(sb, user_id: str) -> Optional[str]:
+    """The authenticated user's org (`app.users.client_id`), derived server-side.
+
+    Keyed by the trusted user_id contextvar — NOT `memory_context.org_id` (which is
+    client-supplied and therefore unusable as a security filter). Returns None if it
+    can't be resolved, and the caller FAILS CLOSED (no fetch) in that case.
+    """
+    if not user_id:
+        return None
+    try:
+        result = (
+            sb.schema(_SCHEMA)
+            .table("users")
+            .select("client_id")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        if rows:
+            return rows[0].get("client_id")
+    except Exception as e:  # pragma: no cover - network/db dependent
+        logger.error("[consult_memory] failed to resolve user org", error=str(e))
+    return None
 
 
 def _get_subagent_model() -> str:
@@ -124,16 +175,27 @@ def _get_subagent_model() -> str:
 # Note fetch (allow-list bounded)
 # ---------------------------------------------------------------------------
 
-def _fetch_allowed_notes(sb, allowed_note_ids: List[str]) -> List[Dict[str, Any]]:
-    """Fetch note bodies for the allow-listed ids only (capped)."""
+def _fetch_allowed_notes(
+    sb, allowed_note_ids: List[str], org_id: str
+) -> List[Dict[str, Any]]:
+    """Fetch note bodies for the allow-listed ids, RE-SCOPED to the caller's org.
+
+    Two predicates, both required:
+      • `.in_("id", ids)`         — the forwarded subtree allow-list, and
+      • `.eq("client_id", org_id)` — the server-derived org of the AUTHENTICATED
+        user. This second predicate is the tenant boundary: a forged allow-list
+        containing another org's note ids matches zero rows here, so retrieval can
+        never cross orgs even though the service-role client bypasses RLS.
+    """
     ids = [str(i) for i in allowed_note_ids if i][:_MAX_NOTES]
-    if not ids:
+    if not ids or not org_id:
         return []
     result = (
         sb.schema(_SCHEMA)
         .table(_TABLE)
         .select("id, path, description, content, internal_summary, context_node_id")
         .in_("id", ids)
+        .eq("client_id", org_id)
         .execute()
     )
     return result.data or []
@@ -259,8 +321,20 @@ def consult_memory(query: str, **kwargs) -> str:
         logger.error("[consult_memory] Supabase unavailable (missing SUPABASE_URL/KEY)")
         return json.dumps({"error": "Memory service unavailable"}, ensure_ascii=False)
 
+    # Tenant boundary: re-derive the org from the AUTHENTICATED user (contextvar),
+    # never from the client-supplied payload. Fail CLOSED if we can't establish it —
+    # fetching without an org filter would let a forged allow-list cross orgs.
+    user_id = _get_user_id()
+    org_id = _resolve_user_org(sb, user_id) if user_id else None
+    if not org_id:
+        logger.error(
+            "[consult_memory] rejected: could not resolve authenticated user's org",
+            has_user_id=bool(user_id),
+        )
+        return json.dumps({"error": "Memory service unavailable"}, ensure_ascii=False)
+
     try:
-        notes = _fetch_allowed_notes(sb, allowed_note_ids)
+        notes = _fetch_allowed_notes(sb, allowed_note_ids, org_id)
     except Exception as e:
         logger.exception("[consult_memory] note fetch failed", error=str(e))
         return json.dumps({"error": f"Failed to fetch memory: {e}"}, ensure_ascii=False)
