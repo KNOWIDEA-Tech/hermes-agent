@@ -75,6 +75,55 @@ def _get_active_project_id() -> Optional[str]:
     return os.environ.get("HERMES_ACTIVE_PROJECT_ID")
 
 
+def _get_notes_context_node_id() -> Optional[str]:
+    """The attached notes-context node id for this turn, or None.
+
+    Read from the memory_context contextvar the web app forwards (its root_node_id
+    is the Team/Project node the user attached in the chat header). When present it
+    is the anchor for AI memory instead of a legacy project — memory then belongs
+    to that context node, mirroring the legacy per-project behavior in the new
+    Notes model. NEVER a tool parameter.
+    """
+    try:
+        from src.utils.user_context import get_memory_context
+
+        scope = get_memory_context()
+        if isinstance(scope, dict):
+            rid = scope.get("root_node_id")
+            if rid:
+                return str(rid)
+    except ImportError:
+        pass
+    return None
+
+
+def _get_org_id() -> Optional[str]:
+    """The acting org for this turn (stamps client_id on newly created memory)."""
+    try:
+        from src.utils.user_context import get_org_id
+
+        return get_org_id()
+    except ImportError:
+        return os.environ.get("HERMES_ORG_ID") or None
+
+
+def _resolve_memory_anchor() -> tuple[Optional[str], Optional[str]]:
+    """Where this turn's AI memory lives: (context_node_id, project_id).
+
+    Exactly one is non-None. A notes context (context node) wins when attached —
+    that's the "current project" in the new Notes model; otherwise fall back to the
+    legacy selected project. Returns (None, None) when neither is bound, and the
+    caller rejects the write.
+    """
+    node_id = _get_notes_context_node_id()
+    if node_id:
+        return node_id, None
+    project_id = _get_active_project_id()
+    if project_id:  # non-empty, non-None
+        return None, project_id
+    return None, None
+
+
 def _exclude_detached_memory(query):
     """Hide the AI-maintained memory note from the read tools when this chat has
     memory detached (per-chat toggle OFF). Detached must mean unreachable by ANY
@@ -486,11 +535,19 @@ def update_memory(operation: str, content: str, **kwargs) -> str:
         logger.warning("[Memory][tool] rejected: no user context")
         return json.dumps({"error": "User context not available"}, ensure_ascii=False)
 
-    project_id = _get_active_project_id()
-    if not project_id:
-        logger.info("[Memory][tool] rejected: no project selected (user=%s)", user_id)
+    # AI memory anchors to the attached notes-context node when present, else the
+    # legacy selected project. Exactly one of these is set.
+    context_node_id, project_id = _resolve_memory_anchor()
+    logger.info(
+        "[Memory][tool] anchor resolved: type=%s id=%s user=%s",
+        "context_node" if context_node_id else ("project" if project_id else "none"),
+        context_node_id or project_id or "-",
+        user_id,
+    )
+    if not context_node_id and not project_id:
+        logger.info("[Memory][tool] rejected: no project/notes context selected (user=%s)", user_id)
         return json.dumps(
-            {"error": "No project selected — project memory is unavailable for this chat."},
+            {"error": "No project or notes context selected — memory is unavailable for this chat."},
             ensure_ascii=False,
         )
 
@@ -520,18 +577,22 @@ def update_memory(operation: str, content: str, **kwargs) -> str:
     try:
         _set_rls_context(sb, user_id)
 
-        # Locate the (single) AI Memory node for this project.
-        node_res = (
+        # Locate the (single) AI Memory node for this anchor (context node OR
+        # legacy project). memory_kind stays 'project' — it's the discriminator for
+        # "node-scoped chat memory" regardless of which column anchors it.
+        node_query = (
             sb.schema(_SCHEMA)
             .table(_TABLE)
             .select("id, path, content")
             .eq("user_id", user_id)
-            .eq("project_id", project_id)
             .eq("is_agent_memory", True)
             .eq("memory_kind", "project")
-            .limit(1)
-            .execute()
         )
+        if context_node_id:
+            node_query = node_query.eq("context_node_id", context_node_id)
+        else:
+            node_query = node_query.eq("project_id", project_id)
+        node_res = node_query.limit(1).execute()
         node = (node_res.data or [None])[0]
         existing_bullets = _bullets_from_content(node.get("content") if node else None)
 
@@ -598,29 +659,49 @@ def update_memory(operation: str, content: str, **kwargs) -> str:
             )
 
         if node:
+            logger.info(
+                "[Memory][tool] updating existing memory note id=%s anchor=%s user=%s",
+                node["id"],
+                f"context_node:{context_node_id}" if context_node_id else f"project:{project_id}",
+                user_id,
+            )
             sb.schema(_SCHEMA).table(_TABLE).update({"content": next_content}).eq(
                 "id", node["id"]
             ).eq("user_id", user_id).execute()
             note_id = node["id"]
         else:
-            # Lazy create on the first fact for this project.
+            logger.info(
+                "[Memory][tool] creating new memory note anchor=%s user=%s",
+                f"context_node:{context_node_id}" if context_node_id else f"project:{project_id}",
+                user_id,
+            )
+            # Lazy create on the first fact for this anchor. Anchor by
+            # context_node_id (notes context) OR project_id (legacy) — never both.
+            # Stamp client_id from the acting org so the note is org-scoped (matches
+            # user_notes' tenant column and lets the notes sub-agent re-scope fetches
+            # by org). project_id stays NULL for a context-node-anchored memory.
+            insert_payload = {
+                "user_id": user_id,
+                "path": _MEMORY_NODE_PATH,
+                "content": next_content,
+                "description": _MEMORY_NODE_DESCRIPTION,
+                "is_important": False,
+                "is_company_context": False,
+                "is_attached": False,
+                "is_agent_memory": True,
+                "memory_kind": "project",
+            }
+            if context_node_id:
+                insert_payload["context_node_id"] = context_node_id
+            else:
+                insert_payload["project_id"] = project_id
+            org_id = _get_org_id()
+            if org_id:
+                insert_payload["client_id"] = org_id
             ins = (
                 sb.schema(_SCHEMA)
                 .table(_TABLE)
-                .insert(
-                    {
-                        "user_id": user_id,
-                        "project_id": project_id,
-                        "path": _MEMORY_NODE_PATH,
-                        "content": next_content,
-                        "description": _MEMORY_NODE_DESCRIPTION,
-                        "is_important": False,
-                        "is_company_context": False,
-                        "is_attached": False,
-                        "is_agent_memory": True,
-                        "memory_kind": "project",
-                    }
-                )
+                .insert(insert_payload)
                 .execute()
             )
             note_id = (ins.data or [{}])[0].get("id")
@@ -650,11 +731,11 @@ def update_memory(operation: str, content: str, **kwargs) -> str:
             logger.warning("[user_notes] update_memory: provenance write failed: %s", edit_err)
 
         logger.info(
-            "[Memory][tool] wrote: op=%s facts=%d user=%s project=%s note=%s edit=%s",
+            "[Memory][tool] wrote: op=%s facts=%d user=%s anchor=%s note=%s edit=%s",
             operation,
             len(added_lines),
             user_id,
-            project_id,
+            f"context_node:{context_node_id}" if context_node_id else f"project:{project_id}",
             note_id,
             edit_id,
         )
