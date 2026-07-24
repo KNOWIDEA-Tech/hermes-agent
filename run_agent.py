@@ -405,6 +405,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        usage_listener: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -533,6 +534,7 @@ class AIAgent:
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
+        self.usage_listener = usage_listener
         self.tool_gen_callback = tool_gen_callback
         self._last_reported_tool = None  # Track for "new tool" mode
         
@@ -6069,6 +6071,27 @@ class AIAgent:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+
+                        # Per-call usage delta for external metering (never
+                        # allowed to interfere with the run).
+                        if self.usage_listener is not None:
+                            try:
+                                self.usage_listener({
+                                    "input_tokens": canonical_usage.input_tokens,
+                                    "output_tokens": canonical_usage.output_tokens,
+                                    "total_tokens": canonical_usage.total_tokens,
+                                    "reasoning_tokens": canonical_usage.reasoning_tokens,
+                                    "cache_read_tokens": canonical_usage.cache_read_tokens,
+                                    "cache_write_tokens": canonical_usage.cache_write_tokens,
+                                    "cost_usd": (float(cost_result.amount_usd)
+                                                 if cost_result.amount_usd is not None else None),
+                                    "cost_status": cost_result.status,
+                                    "cost_source": cost_result.source,
+                                    "model": self.model,
+                                    "provider": getattr(self, "provider", None),
+                                })
+                            except Exception as _ul_err:
+                                logger.debug("usage_listener error: %s", _ul_err)
 
                         # Persist token counts to session DB for /insights.
                         # Gateway sessions persist via session_store.update_session()

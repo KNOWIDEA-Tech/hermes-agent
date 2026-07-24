@@ -197,6 +197,11 @@ def _build_child_agent(
     # count toward the session-wide limit.
     shared_budget = getattr(parent_agent, "iteration_budget", None)
 
+    # Subagents inherit the parent's usage_listener so their per-call
+    # spend deltas are metered too (external metering shouldn't stop
+    # tracking spend just because it happened inside a delegation).
+    shared_usage_listener = getattr(parent_agent, "usage_listener", None)
+
     # Resolve effective credentials: config override > parent inherit
     effective_model = model or parent_agent.model
     effective_provider = override_provider or getattr(parent_agent, "provider", None)
@@ -233,6 +238,7 @@ def _build_child_agent(
         provider_sort=parent_agent.provider_sort,
         tool_progress_callback=child_progress_cb,
         iteration_budget=shared_budget,
+        usage_listener=shared_usage_listener,
     )
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
