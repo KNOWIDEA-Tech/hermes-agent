@@ -202,6 +202,59 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
+class CostBudget:
+    """Thread-safe shared USD spend ceiling for parent and child agents.
+
+    The 2026-07-24 cost incident showed that every retry/iteration cap in the
+    loop is bounded *individually* but their product is not: (API retries) x
+    (fallback resets) x (iterations) x (client-side whole-turn retries) had no
+    global dollar bound, and one chat turn burned ~$35 producing nothing. This
+    is that bound.
+
+    Mirrors :class:`IterationBudget`: a single ``CostBudget`` is created by the
+    caller, passed to the parent agent, and inherited by every subagent
+    (``delegate_task``) so delegation cannot bypass the ceiling. Spend is
+    accumulated from ``estimate_usage_cost`` after each successful API call;
+    when the ceiling is crossed the agent loop stops making tool calls and
+    produces a final summary from the work done so far (same graceful exit as
+    the iteration cap — never a hard error).
+
+    Unlike ``iteration_budget``, this is NOT reset by ``run_conversation`` —
+    its lifetime is the caller's choice, so a recovery re-prompt on the same
+    agent shares the same per-turn ceiling instead of doubling it.
+
+    Note: calls whose cost cannot be priced (unknown model pricing) add
+    nothing, so the ceiling is best-effort — it bounds runaway spend on priced
+    models rather than guaranteeing an exact total.
+    """
+
+    def __init__(self, max_usd: float):
+        self.max_usd = float(max_usd)
+        self._spent_usd = 0.0
+        self._lock = threading.Lock()
+
+    def add(self, amount_usd: float) -> None:
+        """Record spend. Negative/invalid amounts are ignored."""
+        try:
+            amount = float(amount_usd)
+        except (TypeError, ValueError):
+            return
+        if amount <= 0:
+            return
+        with self._lock:
+            self._spent_usd += amount
+
+    @property
+    def spent_usd(self) -> float:
+        with self._lock:
+            return self._spent_usd
+
+    @property
+    def exceeded(self) -> bool:
+        with self._lock:
+            return self._spent_usd >= self.max_usd
+
+
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
@@ -416,6 +469,7 @@ class AIAgent:
         honcho_manager=None,
         honcho_config=None,
         iteration_budget: "IterationBudget" = None,
+        cost_budget: "CostBudget" = None,
         fallback_model: Dict[str, Any] = None,
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
@@ -471,6 +525,11 @@ class AIAgent:
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
+        # Optional shared USD spend ceiling (see CostBudget). None = no ceiling
+        # (the default — preserves existing behavior for every caller that
+        # doesn't opt in). Children inherit the parent's budget via
+        # delegate_task so subagent spend counts against the same ceiling.
+        self.cost_budget = cost_budget
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -5245,15 +5304,28 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in context pressure", exc_info=True)
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
-        """Request a summary when max iterations are reached. Returns the final response text."""
-        print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+    def _handle_max_iterations(self, messages: list, api_call_count: int, reason: str = "iterations") -> str:
+        """Request a summary when a run budget is exhausted. Returns the final response text.
 
-        summary_request = (
-            "You've reached the maximum number of tool-calling iterations allowed. "
-            "Please provide a final response summarizing what you've found and accomplished so far, "
-            "without calling any more tools."
-        )
+        ``reason`` selects the wording: "iterations" (the default — max
+        tool-calling iterations reached) or "cost" (the CostBudget spend
+        ceiling was crossed). Both exits are identical otherwise: one final
+        no-tools call that summarizes the work done so far.
+        """
+        if reason == "cost":
+            print(f"💸 Spend ceiling reached after {api_call_count} API calls. Requesting summary...")
+            summary_request = (
+                "This run has reached its spend limit. "
+                "Please provide a final response summarizing what you've found and accomplished so far, "
+                "without calling any more tools."
+            )
+        else:
+            print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+            summary_request = (
+                "You've reached the maximum number of tool-calling iterations allowed. "
+                "Please provide a final response summarizing what you've found and accomplished so far, "
+                "without calling any more tools."
+            )
         messages.append({"role": "user", "content": summary_request})
 
         try:
@@ -5608,6 +5680,7 @@ class AIAgent:
         api_call_count = 0
         final_response = None
         interrupted = False
+        cost_limited = False
         codex_ack_continuations = 0
         length_continue_retries = 0
         truncated_response_prefix = ""
@@ -5626,7 +5699,29 @@ class AIAgent:
                 if not self.quiet_mode:
                     self._safe_print(f"\n⚡ Breaking out of tool loop due to interrupt...")
                 break
-            
+
+            # Hard per-run spend ceiling (shared with subagents via CostBudget).
+            # Checked BEFORE each API call so a run that crossed the ceiling on
+            # its last call stops here instead of paying for another full
+            # iteration. Exits to the same summary path as the iteration cap.
+            if self.cost_budget is not None and self.cost_budget.exceeded:
+                cost_limited = True
+                self._vprint(
+                    f"\n{self.log_prefix}💸 Spend ceiling reached: "
+                    f"${self.cost_budget.spent_usd:.2f} >= ${self.cost_budget.max_usd:.2f} "
+                    f"(including subagents) after {api_call_count} API calls — "
+                    f"stopping tool calls and summarizing.",
+                    force=True,
+                )
+                logger.warning(
+                    "Cost budget exceeded: spent=%.4f max=%.4f api_calls=%s model=%s",
+                    self.cost_budget.spent_usd,
+                    self.cost_budget.max_usd,
+                    api_call_count,
+                    self.model,
+                )
+                break
+
             api_call_count += 1
             if not self.iteration_budget.consume():
                 if not self.quiet_mode:
@@ -6067,6 +6162,9 @@ class AIAgent:
                         )
                         if cost_result.amount_usd is not None:
                             self.session_estimated_cost_usd += float(cost_result.amount_usd)
+                            # Feed the shared spend ceiling (parent + subagents).
+                            if self.cost_budget is not None:
+                                self.cost_budget.add(float(cost_result.amount_usd))
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
 
@@ -7124,7 +7222,20 @@ class AIAgent:
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
-        if final_response is None and (
+        if final_response is None and cost_limited:
+            if api_call_count > 0:
+                # One final bounded no-tools call to salvage an answer from the
+                # work already paid for.
+                final_response = self._handle_max_iterations(messages, api_call_count, reason="cost")
+            else:
+                # The budget was already exhausted when this run started (e.g. a
+                # recovery re-prompt on the same agent) — don't spend even the
+                # summary call.
+                final_response = (
+                    "This run was stopped before it started because its spend "
+                    "limit was already reached."
+                )
+        elif final_response is None and (
             api_call_count >= self.max_iterations
             or self.iteration_budget.remaining <= 0
         ):
@@ -7181,6 +7292,9 @@ class AIAgent:
             "estimated_cost_usd": self.session_estimated_cost_usd,
             "cost_status": self.session_cost_status,
             "cost_source": self.session_cost_source,
+            # True when the run was stopped by the CostBudget spend ceiling
+            # (final_response is then a summary of the work done so far).
+            "cost_limited": cost_limited,
         }
         self._response_was_previewed = False
         
