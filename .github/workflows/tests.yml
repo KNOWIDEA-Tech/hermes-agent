@@ -36,7 +36,9 @@ jobs:
           source .venv/bin/activate
           python -m pytest tests/ -q --ignore=tests/integration --tb=short -n auto
         env:
-          # Ensure tests don't accidentally call real APIs
-          OPENROUTER_API_KEY: ""
-          OPENAI_API_KEY: ""
-          NOUS_API_KEY: ""
+          # Dummy non-empty keys: clients construct (the SDK rejects an empty
+          # key), but the keys are invalid so no test can reach a real API —
+          # every API call in the suite is mocked.
+          OPENROUTER_API_KEY: "sk-ci-dummy"
+          OPENAI_API_KEY: "sk-ci-dummy"
+          NOUS_API_KEY: "sk-ci-dummy"
