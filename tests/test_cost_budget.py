@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from run_agent import AIAgent, CostBudget
+from run_agent import AIAgent, CostBudget, IterationBudget
 
 
 # ---------------------------------------------------------------------------
@@ -221,6 +221,103 @@ class TestCostBudgetLoop:
         assert result["final_response"] == "Final answer"
         assert result["cost_limited"] is False
         assert budget.spent_usd == 0.0
+
+
+class TestCostLimitedSummaryPath:
+    """Review findings F3/F4 (PR #10): the salvage summary's copy and metering."""
+
+    def test_summary_failure_fallback_mentions_spend_limit(self):
+        """If the cost-path salvage call raises, the fallback must say SPEND
+        limit — not the misleading 'maximum iterations' copy."""
+        budget = CostBudget(5.0)
+        agent = _make_agent(cost_budget=budget)
+        tc = _mock_tool_call(call_id="c1")
+        resp_tools = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc], usage=_USAGE
+        )
+        agent.client.chat.completions.create.side_effect = [
+            resp_tools,
+            RuntimeError("summary upstream down"),
+        ]
+        with (
+            patch("run_agent.handle_function_call", return_value="tool output"),
+            patch("run_agent.estimate_usage_cost", return_value=_cost_result(6.0)),
+        ):
+            result = _run(agent, "expensive question")
+        assert result["cost_limited"] is True
+        assert "spend limit" in result["final_response"]
+        assert "maximum iterations" not in result["final_response"]
+
+    def test_summary_call_usage_is_metered(self):
+        """The salvage call's own tokens/cost must land in the session counters
+        and the shared CostBudget (review finding: it was invisible spend)."""
+        budget = CostBudget(5.0)
+        agent = _make_agent(cost_budget=budget)
+        tc = _mock_tool_call(call_id="c1")
+        resp_tools = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc], usage=_USAGE
+        )
+        resp_summary = _mock_response(
+            content="Summary of work so far.", finish_reason="stop", usage=_USAGE
+        )
+        agent.client.chat.completions.create.side_effect = [resp_tools, resp_summary]
+        with (
+            patch("run_agent.handle_function_call", return_value="tool output"),
+            patch("run_agent.estimate_usage_cost", return_value=_cost_result(6.0)),
+        ):
+            result = _run(agent, "expensive question")
+        assert result["cost_limited"] is True
+        # Both the loop call AND the summary call are counted.
+        assert agent.session_api_calls == 2
+        assert budget.spent_usd == pytest.approx(12.0)
+        assert result["estimated_cost_usd"] == pytest.approx(12.0)
+
+
+class TestIterationBudgetOwnership:
+    """Review finding F1 (PR #10): run_conversation's unconditional budget
+    reset silently handed delegate children a fresh full budget, so the
+    documented shared cap never constrained them."""
+
+    def test_external_budget_is_not_replaced_by_run_conversation(self):
+        shared = IterationBudget(50)
+        agent = _make_agent(iteration_budget=shared)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        result = _run(agent)
+        assert result["final_response"] == "Done"
+        assert agent.iteration_budget is shared, (
+            "externally provided (shared) budget must survive run_conversation"
+        )
+        assert shared.used == 1  # the child's call drained the SHARED pool
+
+    def test_self_owned_budget_still_resets_per_turn(self):
+        """CLI/gateway parents keep the existing per-turn refresh."""
+        agent = _make_agent()
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        _run(agent)
+        first = agent.iteration_budget
+        _run(agent)
+        assert agent.iteration_budget is not first
+        assert agent.iteration_budget.used == 1  # only the second turn's call
+
+    def test_exhausted_shared_budget_skips_the_tool_loop(self):
+        shared = IterationBudget(1)
+        shared.consume()  # parent already spent the whole pool
+        agent = _make_agent(iteration_budget=shared)
+        agent.client.chat.completions.create.return_value = _mock_response(
+            content="Done", finish_reason="stop"
+        )
+        result = _run(agent)
+        # The tool loop never runs (remaining == 0); the ONE call made is the
+        # pre-existing salvage summary, identifiable by its injected request.
+        assert agent.client.chat.completions.create.call_count == 1
+        only_call = agent.client.chat.completions.create.call_args
+        assert "maximum number of tool-calling iterations" in only_call.kwargs["messages"][-1]["content"]
+        assert result["api_calls"] == 0
+        assert shared.used == 1  # unchanged — nothing consumed by this run
 
 
 # ---------------------------------------------------------------------------

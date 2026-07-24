@@ -524,6 +524,13 @@ class AIAgent:
         self.max_iterations = max_iterations
         # Shared iteration budget — parent creates, children inherit.
         # Consumed by every LLM turn across parent + all subagents.
+        # _owns_iteration_budget: True when this agent created its own budget
+        # (CLI/gateway parents) — run_conversation refreshes those per turn.
+        # False when the budget was provided externally (delegate children
+        # sharing the parent's pool) — those must NOT be replaced, or the
+        # child silently grants itself a fresh full budget and the "shared
+        # cap across parent + subagents" stops being a cap at all.
+        self._owns_iteration_budget = iteration_budget is None
         self.iteration_budget = iteration_budget or IterationBudget(max_iterations)
         # Optional shared USD spend ceiling (see CostBudget). None = no ceiling
         # (the default — preserves existing behavior for every caller that
@@ -5319,6 +5326,7 @@ class AIAgent:
                 "Please provide a final response summarizing what you've found and accomplished so far, "
                 "without calling any more tools."
             )
+            _fallback_msg = "I hit this run's spend limit and couldn't generate a summary."
         else:
             print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
             summary_request = (
@@ -5326,7 +5334,38 @@ class AIAgent:
                 "Please provide a final response summarizing what you've found and accomplished so far, "
                 "without calling any more tools."
             )
+            _fallback_msg = "I reached the iteration limit and couldn't generate a summary."
         messages.append({"role": "user", "content": summary_request})
+
+        def _meter_summary_usage(resp) -> None:
+            """Meter the salvage call's own usage into the session counters and
+            the shared CostBudget. The summary is one bounded no-tools call, but
+            on a large context it's real spend — leaving it out of the very
+            telemetry/budget this exit exists for was a review finding. Metering
+            must never break the summary path, hence the blanket except."""
+            try:
+                if resp is None or not getattr(resp, "usage", None):
+                    return
+                cu = normalize_usage(resp.usage, provider=self.provider, api_mode=self.api_mode)
+                self.session_prompt_tokens += cu.prompt_tokens
+                self.session_completion_tokens += cu.output_tokens
+                self.session_total_tokens += cu.total_tokens
+                self.session_api_calls += 1
+                self.session_input_tokens += cu.input_tokens
+                self.session_output_tokens += cu.output_tokens
+                self.session_cache_read_tokens += cu.cache_read_tokens
+                self.session_cache_write_tokens += cu.cache_write_tokens
+                self.session_reasoning_tokens += cu.reasoning_tokens
+                cr = estimate_usage_cost(
+                    self.model, cu, provider=self.provider,
+                    base_url=self.base_url, api_key=getattr(self, "api_key", ""),
+                )
+                if cr.amount_usd is not None:
+                    self.session_estimated_cost_usd += float(cr.amount_usd)
+                    if self.cost_budget is not None:
+                        self.cost_budget.add(float(cr.amount_usd))
+            except Exception:
+                logging.debug("summary usage metering failed", exc_info=True)
 
         try:
             # Build API messages, stripping internal-only fields
@@ -5368,6 +5407,7 @@ class AIAgent:
                 codex_kwargs = self._build_api_kwargs(api_messages)
                 codex_kwargs.pop("tools", None)
                 summary_response = self._run_codex_stream(codex_kwargs)
+                _meter_summary_usage(summary_response)
                 assistant_message, _ = self._normalize_codex_response(summary_response)
                 final_response = (assistant_message.content or "").strip() if assistant_message else ""
             else:
@@ -5401,10 +5441,12 @@ class AIAgent:
                                    is_oauth=getattr(self, '_is_anthropic_oauth', False),
                                    preserve_dots=self._anthropic_preserve_dots())
                     summary_response = self._anthropic_messages_create(_ant_kw)
+                    _meter_summary_usage(summary_response)
                     _msg, _ = _nar(summary_response, strip_tool_prefix=getattr(self, '_is_anthropic_oauth', False))
                     final_response = (_msg.content or "").strip()
                 else:
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                    _meter_summary_usage(summary_response)
 
                     if summary_response.choices and summary_response.choices[0].message.content:
                         final_response = summary_response.choices[0].message.content
@@ -5417,13 +5459,14 @@ class AIAgent:
                 if final_response:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = _fallback_msg
             else:
                 # Retry summary generation
                 if self.api_mode == "codex_responses":
                     codex_kwargs = self._build_api_kwargs(api_messages)
                     codex_kwargs.pop("tools", None)
                     retry_response = self._run_codex_stream(codex_kwargs)
+                    _meter_summary_usage(retry_response)
                     retry_msg, _ = self._normalize_codex_response(retry_response)
                     final_response = (retry_msg.content or "").strip() if retry_msg else ""
                 elif self.api_mode == "anthropic_messages":
@@ -5433,6 +5476,7 @@ class AIAgent:
                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                     preserve_dots=self._anthropic_preserve_dots())
                     retry_response = self._anthropic_messages_create(_ant_kw2)
+                    _meter_summary_usage(retry_response)
                     _retry_msg, _ = _nar2(retry_response, strip_tool_prefix=getattr(self, '_is_anthropic_oauth', False))
                     final_response = (_retry_msg.content or "").strip()
                 else:
@@ -5446,6 +5490,7 @@ class AIAgent:
                         summary_kwargs["extra_body"] = summary_extra_body
 
                     summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary_retry").chat.completions.create(**summary_kwargs)
+                    _meter_summary_usage(summary_response)
 
                     if summary_response.choices and summary_response.choices[0].message.content:
                         final_response = summary_response.choices[0].message.content
@@ -5458,13 +5503,13 @@ class AIAgent:
                     if final_response:
                         messages.append({"role": "assistant", "content": final_response})
                     else:
-                        final_response = "I reached the iteration limit and couldn't generate a summary."
+                        final_response = _fallback_msg
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = _fallback_msg
 
         except Exception as e:
             logging.warning(f"Failed to get summary response: {e}")
-            final_response = f"I reached the maximum iterations ({self.max_iterations}) but couldn't summarize. Error: {str(e)}"
+            final_response = f"{_fallback_msg} Error: {str(e)}"
 
         return final_response
 
@@ -5522,7 +5567,15 @@ class AIAgent:
         # NOTE: _turns_since_memory and _iters_since_skill are NOT reset here.
         # They are initialized in __init__ and must persist across run_conversation
         # calls so that nudge logic accumulates correctly in CLI mode.
-        self.iteration_budget = IterationBudget(self.max_iterations)
+        #
+        # Only refresh a SELF-OWNED iteration budget (CLI/gateway parents get a
+        # fresh per-turn budget as before). An externally-provided budget is the
+        # parent's shared pool — replacing it here silently handed every
+        # delegate child a fresh full budget, making the documented shared cap
+        # a no-op (found in the 2026-07-24 cost-incident review). The shared
+        # CostBudget is intentionally never reset for the same reason.
+        if self._owns_iteration_budget:
+            self.iteration_budget = IterationBudget(self.max_iterations)
         
         # Initialize conversation (copy to avoid mutating the caller's list)
         messages = list(conversation_history) if conversation_history else []
