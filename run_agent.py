@@ -1417,6 +1417,7 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        usage_listener=self.usage_listener,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -6073,7 +6074,11 @@ class AIAgent:
                         self.session_cost_source = cost_result.source
 
                         # Per-call usage delta for external metering (never
-                        # allowed to interfere with the run).
+                        # allowed to interfere with the run). Delegate subagents
+                        # share the parent's usage_listener (see delegate_tool.py)
+                        # and run on their own threads, so this callback may be
+                        # invoked concurrently from multiple child threads —
+                        # implementations must be fast and thread-safe.
                         if self.usage_listener is not None:
                             try:
                                 self.usage_listener({

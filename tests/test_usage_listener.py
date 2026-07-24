@@ -21,12 +21,20 @@ def _usage(prompt=100, completion=50):
     return {"prompt_tokens": prompt, "completion_tokens": completion,
             "total_tokens": prompt + completion}
 
-def _mock_response(content="hi", usage=None):
-    msg = SimpleNamespace(content=content, tool_calls=None)
-    choice = SimpleNamespace(message=msg, finish_reason="stop")
+def _mock_response(content="hi", usage=None, tool_calls=None, finish_reason=None):
+    msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+    resolved_finish_reason = finish_reason or ("tool_calls" if tool_calls else "stop")
+    choice = SimpleNamespace(message=msg, finish_reason=resolved_finish_reason)
     resp = SimpleNamespace(choices=[choice], model="test/model")
     resp.usage = SimpleNamespace(**(usage if usage is not None else _usage()))
     return resp
+
+def _mock_tool_call(name="web_search", arguments="{}", call_id=None):
+    return SimpleNamespace(
+        id=call_id or "call_1",
+        type="function",
+        function=SimpleNamespace(name=name, arguments=arguments),
+    )
 
 def _cost_result(amount):
     c = MagicMock()
@@ -78,6 +86,26 @@ def test_unpriced_call_reports_none_cost():
     with patch("run_agent.estimate_usage_cost", return_value=_cost_result(None)):
         agent.run_conversation("hello")
     assert deltas[0]["cost_usd"] is None
+
+
+def test_listener_receives_one_delta_per_llm_call_across_tool_round_trip():
+    # Mirrors tests/test_run_agent.py's TestRunConversation.test_tool_calls_then_stop:
+    # first response has tool_calls (loop continues), second is a final "stop".
+    deltas = []
+    agent = _make_agent(usage_listener=deltas.append)
+    tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+    resp1 = _mock_response(content="", tool_calls=[tc], usage=_usage(100, 20))
+    resp2 = _mock_response(content="Done searching", usage=_usage(150, 30))
+    agent.client.chat.completions.create.side_effect = [resp1, resp2]
+    with (
+        patch("run_agent.handle_function_call", return_value="search result"),
+        patch("run_agent.estimate_usage_cost", return_value=_cost_result(0.1)),
+    ):
+        result = agent.run_conversation("search something")
+    assert result["final_response"] == "Done searching"
+    assert len(deltas) == 2
+    assert deltas[0]["input_tokens"] == 100 and deltas[0]["output_tokens"] == 20
+    assert deltas[1]["input_tokens"] == 150 and deltas[1]["output_tokens"] == 30
 
 
 def test_delegate_child_inherits_listener():
