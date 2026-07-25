@@ -458,6 +458,7 @@ class AIAgent:
         stream_delta_callback: callable = None,
         tool_gen_callback: callable = None,
         status_callback: callable = None,
+        usage_listener: callable = None,
         max_tokens: int = None,
         reasoning_config: Dict[str, Any] = None,
         prefill_messages: List[Dict[str, Any]] = None,
@@ -599,6 +600,7 @@ class AIAgent:
         self.step_callback = step_callback
         self.stream_delta_callback = stream_delta_callback
         self.status_callback = status_callback
+        self.usage_listener = usage_listener
         self.tool_gen_callback = tool_gen_callback
         self._last_reported_tool = None  # Track for "new tool" mode
         
@@ -1481,6 +1483,7 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        usage_listener=self.usage_listener,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -6245,6 +6248,31 @@ class AIAgent:
                                 self.cost_budget.add(float(cost_result.amount_usd))
                         self.session_cost_status = cost_result.status
                         self.session_cost_source = cost_result.source
+
+                        # Per-call usage delta for external metering (never
+                        # allowed to interfere with the run). Delegate subagents
+                        # share the parent's usage_listener (see delegate_tool.py)
+                        # and run on their own threads, so this callback may be
+                        # invoked concurrently from multiple child threads —
+                        # implementations must be fast and thread-safe.
+                        if self.usage_listener is not None:
+                            try:
+                                self.usage_listener({
+                                    "input_tokens": canonical_usage.input_tokens,
+                                    "output_tokens": canonical_usage.output_tokens,
+                                    "total_tokens": canonical_usage.total_tokens,
+                                    "reasoning_tokens": canonical_usage.reasoning_tokens,
+                                    "cache_read_tokens": canonical_usage.cache_read_tokens,
+                                    "cache_write_tokens": canonical_usage.cache_write_tokens,
+                                    "cost_usd": (float(cost_result.amount_usd)
+                                                 if cost_result.amount_usd is not None else None),
+                                    "cost_status": cost_result.status,
+                                    "cost_source": cost_result.source,
+                                    "model": self.model,
+                                    "provider": getattr(self, "provider", None),
+                                })
+                            except Exception as _ul_err:
+                                logger.debug("usage_listener error: %s", _ul_err)
 
                         # Persist token counts to session DB for /insights.
                         # Gateway sessions persist via session_store.update_session()

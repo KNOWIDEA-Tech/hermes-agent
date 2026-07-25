@@ -286,9 +286,9 @@ class TestSummaryUsageListener:
     """Cross-PR fix (#10 x #11): _meter_summary_usage must fire the per-call
     usage_listener so the salvage call's spend reaches the delta stream
     (hermes's UsageFlusher), not just the session counters / CostBudget.
-    This branch has no usage_listener attribute or kwarg (that's #11), so
-    the tests inject it directly on the agent object — exactly the shape
-    the guarded getattr in _meter_summary_usage looks for."""
+    Now that #11 is merged in, the main-loop call ALSO fires the listener,
+    so a cost-limited run emits two deltas: the breaching main-loop call
+    and the salvage summary call."""
 
     def _drive_salvage(self, agent):
         tc = _mock_tool_call(call_id="c1")
@@ -312,15 +312,17 @@ class TestSummaryUsageListener:
         agent.usage_listener = listener
         result = self._drive_salvage(agent)
         assert result["cost_limited"] is True
-        # Exactly one delta: only the summary metering fires the listener on
-        # this branch (the main-loop firing arrives with #11 itself).
-        assert listener.call_count == 1
-        delta = listener.call_args.args[0]
-        assert set(delta.keys()) == _LISTENER_PAYLOAD_KEYS
-        assert delta["cost_usd"] == pytest.approx(6.0)  # the metered summary cost
-        assert delta["cost_status"] == "estimated"
-        assert delta["cost_source"] == "catalog"
-        assert delta["model"] == agent.model
+        # Two deltas: the breaching main-loop call (#11's block) and the
+        # salvage summary call (#10's _meter_summary_usage) — no spend path
+        # is invisible to the delta stream.
+        assert listener.call_count == 2
+        for call in listener.call_args_list:
+            delta = call.args[0]
+            assert set(delta.keys()) == _LISTENER_PAYLOAD_KEYS
+            assert delta["cost_usd"] == pytest.approx(6.0)
+            assert delta["cost_status"] == "estimated"
+            assert delta["cost_source"] == "catalog"
+            assert delta["model"] == agent.model
 
     def test_raising_listener_does_not_break_salvage(self):
         budget = CostBudget(5.0)
