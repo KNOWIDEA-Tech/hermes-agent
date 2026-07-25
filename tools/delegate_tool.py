@@ -196,6 +196,8 @@ def _build_child_agent(
     # Share the parent's iteration budget so subagent tool calls
     # count toward the session-wide limit.
     shared_budget = getattr(parent_agent, "iteration_budget", None)
+    # Share the parent's spend ceiling so delegation can't bypass it.
+    shared_cost_budget = getattr(parent_agent, "cost_budget", None)
 
     # Subagents inherit the parent's usage_listener so their per-call
     # spend deltas are metered too (external metering shouldn't stop
@@ -239,6 +241,7 @@ def _build_child_agent(
         tool_progress_callback=child_progress_cb,
         iteration_budget=shared_budget,
         usage_listener=shared_usage_listener,
+        cost_budget=shared_cost_budget,
     )
     # Set delegation depth so children can't spawn grandchildren
     child._delegate_depth = getattr(parent_agent, '_delegate_depth', 0) + 1
