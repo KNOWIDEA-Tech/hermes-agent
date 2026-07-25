@@ -129,4 +129,72 @@ def test_delegate_child_inherits_listener():
             )
         except Exception:
             pass  # child run plumbing may fail after construction; we only need the ctor call
+    assert MockAgent.call_args is not None, (
+        "AIAgent ctor never reached — _build_child_agent failed before construction"
+    )
     assert MockAgent.call_args.kwargs.get("usage_listener") is listener
+
+
+def test_background_review_agent_inherits_listener():
+    # _spawn_background_review's _run_review constructs the review AIAgent with
+    # usage_listener=self.usage_listener (run_agent.py ~1420). That kwarg *was*
+    # the fix in 02104d1c — this test pins it so a refactor dropping it fails
+    # loudly. The review thread is run inline (fake Thread) for determinism;
+    # `AIAgent` resolves as a run_agent module global at call time, so patching
+    # run_agent.AIAgent intercepts the ctor.
+    import threading
+
+    listener = MagicMock()
+    parent = _make_agent(usage_listener=listener)
+
+    class _InlineThread:
+        def __init__(self, target=None, daemon=None, name=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    with (
+        patch("run_agent.AIAgent") as MockAgent,
+        patch.object(threading, "Thread", _InlineThread),
+    ):
+        parent._spawn_background_review([], review_memory=True)
+    assert MockAgent.call_args is not None, (
+        "review AIAgent ctor never reached — _run_review failed before construction"
+    )
+    assert MockAgent.call_args.kwargs.get("usage_listener") is listener
+
+
+def test_listener_shared_across_concurrent_agents_receives_all_deltas():
+    # Threading smoke test for the documented contract: one listener may be
+    # fired from multiple threads (main loop, background review, delegate
+    # children each run their own agent instance). Two agents sharing a
+    # listener run concurrently; both deltas must land, unmangled.
+    import threading
+
+    deltas = []
+    lock = threading.Lock()
+
+    def listener(d):
+        with lock:
+            deltas.append(d)
+
+    agents = [_make_agent(usage_listener=listener) for _ in range(2)]
+    for i, a in enumerate(agents):
+        a.client.chat.completions.create.return_value = _mock_response(
+            usage=_usage(100 + i, 50)
+        )
+
+    with patch("run_agent.estimate_usage_cost", return_value=_cost_result(0.05)):
+        threads = [
+            threading.Thread(target=a.run_conversation, args=("hello",))
+            for a in agents
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "agent thread did not finish"
+    assert len(deltas) == 2
+    assert sorted(d["input_tokens"] for d in deltas) == [100, 101]
+    assert all(d["output_tokens"] == 50 and d["cost_usd"] == 0.05 for d in deltas)
