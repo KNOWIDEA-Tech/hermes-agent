@@ -189,8 +189,17 @@ def _tavily_request(endpoint: str, payload: dict) -> dict:
 def _normalize_tavily_search_results(response: dict) -> dict:
     """Normalize Tavily /search response to the standard web search format.
 
-    Tavily returns ``{results: [{title, url, content, score, ...}]}``.
-    We map to ``{success, data: {web: [{title, url, description, position}]}}``.
+    Tavily returns ``{results: [{title, url, content, score, published_date, ...}]}``.
+    We map to ``{success, data: {web: [{title, url, description, position,
+    published_date}]}}``.
+
+    ``published_date`` is carried through DELIBERATELY. The research agent is required
+    to stamp every source with an ``as_of`` date (see the grounding contract in
+    src/prompts/report_split.py), and the framework down-rates stale external figures
+    by a full DCS band on the strength of it. Dropping the date here — as this
+    normalizer used to — left the agent inventing a field the whole recency discipline
+    depends on. An absent date is surfaced as "" so the agent can say "undated" rather
+    than guess.
     """
     web_results = []
     for i, result in enumerate(response.get("results", [])):
@@ -199,6 +208,7 @@ def _normalize_tavily_search_results(response: dict) -> dict:
             "url": result.get("url", ""),
             "description": result.get("content", ""),
             "position": i + 1,
+            "published_date": result.get("published_date", "") or "",
         })
     return {"success": True, "data": {"web": web_results}}
 
@@ -620,6 +630,10 @@ def _parallel_search(query: str, limit: int = 5) -> dict:
             "title": result.title or "",
             "description": " ".join(excerpts) if excerpts else "",
             "position": i + 1,
+            # Best-effort: the SDK does not guarantee this attribute. Surfaced (even as
+            # "") so the agent stamps `as_of` from evidence rather than from memory —
+            # see the note in _normalize_tavily_search_results.
+            "published_date": str(getattr(result, "published_date", "") or ""),
         })
 
     return {"success": True, "data": {"web": web_results}}
@@ -671,6 +685,55 @@ async def _parallel_extract(urls: List[str]) -> List[Dict[str, Any]]:
 
 # ─── Backend failover helpers ─────────────────────────────────────────────────
 
+class ResearchCutoffUnsupported(RuntimeError):
+    """A backend cannot bound results to the configured research cutoff.
+
+    Raised (never swallowed into an unbounded search) so failover moves to a backend
+    that CAN honour the cutoff, and so a run with no such backend fails loudly. A
+    date-bounded backtest whose search silently returned post-cutoff documents would
+    report clean while leaking — worse than having no cutoff at all.
+    """
+
+
+_CUTOFF_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Backends whose search API accepts a publication-date upper bound. Parallel's
+# `.search()` exposes no date filter in the SDK surface we call, and Firecrawl's
+# is not wired here — both therefore REFUSE to run under a cutoff rather than
+# quietly returning today's web.
+_DATE_BOUNDED_BACKENDS = frozenset({"tavily"})
+
+
+def _research_cutoff() -> str:
+    """The configured contamination cutoff (``YYYY-MM-DD``), or "" when unset.
+
+    Set process-wide via ``HERMES_RESEARCH_CUTOFF`` rather than as a tool parameter:
+    a cutoff the model can forget to pass is not a control. A malformed value is
+    treated as unset AND logged, because silently ignoring a cutoff someone thought
+    they had set is the failure this whole mechanism exists to prevent.
+    """
+    raw = (os.getenv("HERMES_RESEARCH_CUTOFF") or "").strip()
+    if not raw:
+        return ""
+    if not _CUTOFF_RE.match(raw):
+        logger.error(
+            "HERMES_RESEARCH_CUTOFF=%r is not YYYY-MM-DD — IGNORING IT. Web search is UNBOUNDED.",
+            raw,
+        )
+        return ""
+    return raw
+
+
+def _assert_can_bound(backend: str) -> str:
+    """Return the active cutoff for `backend`, or raise if it cannot honour one."""
+    cutoff = _research_cutoff()
+    if cutoff and backend not in _DATE_BOUNDED_BACKENDS:
+        raise ResearchCutoffUnsupported(
+            f"backend '{backend}' cannot bound results to HERMES_RESEARCH_CUTOFF={cutoff}"
+        )
+    return cutoff
+
+
 def _failover_order(primary: str) -> List[str]:
     """Ordered key-based single-call backends to try.
 
@@ -688,20 +751,29 @@ def _failover_order(primary: str) -> List[str]:
     for b in (primary, "parallel", "tavily"):
         if keyed.get(b) and b not in out:
             out.append(b)
+    # Under a research cutoff, try the backends that can actually enforce it first.
+    # The others still appear (and will raise ResearchCutoffUnsupported) so the run
+    # ends with an explicit error rather than a silently unbounded result set.
+    if _research_cutoff():
+        out.sort(key=lambda b: b not in _DATE_BOUNDED_BACKENDS)
     return out
 
 
 def _search_single(backend: str, query: str, limit: int) -> dict:
     """Run ONE key-based search backend (parallel|tavily) → normalized
     ``{"success": True, "data": {"web": [...]}}`` dict, or raise on failure."""
+    cutoff = _assert_can_bound(backend)
     if backend == "tavily":
-        logger.info("Tavily search: '%s' (limit: %d)", query, limit)
-        raw = _tavily_request("search", {
+        logger.info("Tavily search: '%s' (limit: %d, cutoff: %s)", query, limit, cutoff or "none")
+        payload = {
             "query": query,
             "max_results": min(limit, 20),
             "include_raw_content": False,
             "include_images": False,
-        })
+        }
+        if cutoff:
+            payload["end_date"] = cutoff
+        raw = _tavily_request("search", payload)
         return _normalize_tavily_search_results(raw)
     return _parallel_search(query, limit)
 
@@ -796,6 +868,10 @@ def web_search_tool(query: str, limit: int = 5) -> str:
             _debug.log_call("web_search_tool", debug_call_data)
             _debug.save()
             return json.dumps({"error": error_msg}, ensure_ascii=False)
+
+        # Firecrawl is the legacy fall-through and cannot bound by publication date
+        # here, so under a cutoff it must refuse rather than return today's web.
+        _assert_can_bound("firecrawl")
 
         if _errs:
             logger.warning("web_search falling back to firecrawl (after: %s)", "; ".join(_errs))

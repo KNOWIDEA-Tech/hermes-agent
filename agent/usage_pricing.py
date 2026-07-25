@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -343,6 +344,33 @@ def _openrouter_pricing_entry(route: BillingRoute) -> Optional[PricingEntry]:
     )
 
 
+_MODEL_VARIANT_SUFFIX_RE = re.compile(r":[a-z0-9_-]+$")
+_MODEL_DATE_SNAPSHOT_RE = re.compile(r"[-.](\d{8})$")
+
+
+def _normalize_model_key(model_id: str) -> str:
+    """Collapse cosmetic id differences (case, ':nitro' variants, trailing
+    dated snapshots, '.' vs '-' separators) so a configured alias like
+    'anthropic/claude-haiku-4-5' still matches the catalog's
+    'anthropic/claude-haiku-4.5' instead of silently pricing as unknown."""
+    key = (model_id or "").strip().lower()
+    key = _MODEL_VARIANT_SUFFIX_RE.sub("", key)
+    key = _MODEL_DATE_SNAPSHOT_RE.sub("", key)
+    return key.replace(".", "-")
+
+
+def _resolve_metadata_key(
+    metadata: Dict[str, Dict[str, Any]], model_id: str
+) -> Optional[str]:
+    if model_id in metadata:
+        return model_id
+    target = _normalize_model_key(model_id)
+    for key in metadata:
+        if _normalize_model_key(key) == target:
+            return key
+    return None
+
+
 def _pricing_entry_from_metadata(
     metadata: Dict[str, Dict[str, Any]],
     model_id: str,
@@ -350,9 +378,10 @@ def _pricing_entry_from_metadata(
     source_url: str,
     pricing_version: str,
 ) -> Optional[PricingEntry]:
-    if model_id not in metadata:
+    resolved_key = _resolve_metadata_key(metadata, model_id)
+    if resolved_key is None:
         return None
-    pricing = metadata[model_id].get("pricing") or {}
+    pricing = metadata[resolved_key].get("pricing") or {}
     prompt = _to_decimal(pricing.get("prompt"))
     completion = _to_decimal(pricing.get("completion"))
     request = _to_decimal(pricing.get("request"))
