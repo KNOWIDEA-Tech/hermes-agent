@@ -5364,6 +5364,31 @@ class AIAgent:
                     self.session_estimated_cost_usd += float(cr.amount_usd)
                     if self.cost_budget is not None:
                         self.cost_budget.add(float(cr.amount_usd))
+                # Forward-compat with the usage_listener PR (feat/usage-listener):
+                # this branch does not define the attribute/kwarg, so getattr
+                # keeps this a no-op until both PRs land together. Once merged,
+                # the salvage call's spend reaches the per-call delta stream
+                # (hermes's UsageFlusher) and not just the session counters.
+                # Payload mirrors the main-loop delta field-for-field.
+                listener = getattr(self, "usage_listener", None)
+                if listener is not None:
+                    try:
+                        listener({
+                            "input_tokens": cu.input_tokens,
+                            "output_tokens": cu.output_tokens,
+                            "total_tokens": cu.total_tokens,
+                            "reasoning_tokens": cu.reasoning_tokens,
+                            "cache_read_tokens": cu.cache_read_tokens,
+                            "cache_write_tokens": cu.cache_write_tokens,
+                            "cost_usd": (float(cr.amount_usd)
+                                         if cr.amount_usd is not None else None),
+                            "cost_status": cr.status,
+                            "cost_source": cr.source,
+                            "model": self.model,
+                            "provider": getattr(self, "provider", None),
+                        })
+                    except Exception as _ul_err:
+                        logger.debug("usage_listener error: %s", _ul_err)
             except Exception:
                 logging.debug("summary usage metering failed", exc_info=True)
 
@@ -7296,7 +7321,12 @@ class AIAgent:
                 print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} used, including subagents)")
             final_response = self._handle_max_iterations(messages, api_call_count)
         
-        # Determine if conversation completed successfully
+        # Determine if conversation completed successfully.
+        # Note: cost-limited runs deliberately report completed=True (the
+        # salvage summary is a usable final answer, and completed=True
+        # suppresses client-side whole-turn retries that would re-spend the
+        # budget). Consumers must check `cost_limited` to detect truncation —
+        # unlike iteration-capped runs, which report completed=False.
         completed = final_response is not None and api_call_count < self.max_iterations
 
         # Save trajectory if enabled

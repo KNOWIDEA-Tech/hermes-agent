@@ -273,6 +273,67 @@ class TestCostLimitedSummaryPath:
         assert result["estimated_cost_usd"] == pytest.approx(12.0)
 
 
+# Field-for-field contract of the per-call delta fired by the usage_listener
+# (feat/usage-listener PR); _meter_summary_usage must emit the same shape.
+_LISTENER_PAYLOAD_KEYS = {
+    "input_tokens", "output_tokens", "total_tokens", "reasoning_tokens",
+    "cache_read_tokens", "cache_write_tokens",
+    "cost_usd", "cost_status", "cost_source", "model", "provider",
+}
+
+
+class TestSummaryUsageListener:
+    """Cross-PR fix (#10 x #11): _meter_summary_usage must fire the per-call
+    usage_listener so the salvage call's spend reaches the delta stream
+    (hermes's UsageFlusher), not just the session counters / CostBudget.
+    This branch has no usage_listener attribute or kwarg (that's #11), so
+    the tests inject it directly on the agent object — exactly the shape
+    the guarded getattr in _meter_summary_usage looks for."""
+
+    def _drive_salvage(self, agent):
+        tc = _mock_tool_call(call_id="c1")
+        resp_tools = _mock_response(
+            content="", finish_reason="tool_calls", tool_calls=[tc], usage=_USAGE
+        )
+        resp_summary = _mock_response(
+            content="Summary of work so far.", finish_reason="stop", usage=_USAGE
+        )
+        agent.client.chat.completions.create.side_effect = [resp_tools, resp_summary]
+        with (
+            patch("run_agent.handle_function_call", return_value="tool output"),
+            patch("run_agent.estimate_usage_cost", return_value=_cost_result(6.0)),
+        ):
+            return _run(agent, "expensive question")
+
+    def test_summary_metering_fires_listener_with_contract_payload(self):
+        budget = CostBudget(5.0)
+        agent = _make_agent(cost_budget=budget)
+        listener = MagicMock()
+        agent.usage_listener = listener
+        result = self._drive_salvage(agent)
+        assert result["cost_limited"] is True
+        # Exactly one delta: only the summary metering fires the listener on
+        # this branch (the main-loop firing arrives with #11 itself).
+        assert listener.call_count == 1
+        delta = listener.call_args.args[0]
+        assert set(delta.keys()) == _LISTENER_PAYLOAD_KEYS
+        assert delta["cost_usd"] == pytest.approx(6.0)  # the metered summary cost
+        assert delta["cost_status"] == "estimated"
+        assert delta["cost_source"] == "catalog"
+        assert delta["model"] == agent.model
+
+    def test_raising_listener_does_not_break_salvage(self):
+        budget = CostBudget(5.0)
+        agent = _make_agent(cost_budget=budget)
+        agent.usage_listener = MagicMock(side_effect=RuntimeError("listener boom"))
+        result = self._drive_salvage(agent)
+        assert result["cost_limited"] is True
+        assert result["final_response"] == "Summary of work so far."
+        # Metering itself still completed despite the raising listener.
+        assert budget.spent_usd == pytest.approx(12.0)
+        assert agent.session_api_calls == 2
+
+
 class TestIterationBudgetOwnership:
     """Review finding F1 (PR #10): run_conversation's unconditional budget
     reset silently handed delegate children a fresh full budget, so the
