@@ -46,6 +46,14 @@ class _FakeQuery:
         self._rows = [r for r in self._rows if r.get(column) == value]
         return self
 
+    def or_(self, expr):
+        # PostgREST `.or_("is_user_context.eq.false,user_id.eq.<caller>")` — the
+        # personal-overlay predicate. Recorded but not applied: these fixtures
+        # exercise the org (client_id) boundary and don't carry the overlay
+        # columns, so filtering here would drop otherwise-valid rows.
+        self.applied.append(("or", expr))
+        return self
+
     def limit(self, n):
         self._rows = self._rows[:n]
         return self
