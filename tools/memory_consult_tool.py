@@ -186,26 +186,34 @@ def _get_subagent_model() -> str:
 # ---------------------------------------------------------------------------
 
 def _fetch_allowed_notes(
-    sb, allowed_note_ids: List[str], org_id: str
+    sb, allowed_note_ids: List[str], org_id: str, user_id: str
 ) -> List[Dict[str, Any]]:
     """Fetch note bodies for the allow-listed ids, RE-SCOPED to the caller's org.
 
-    Two predicates, both required:
+    Three predicates, all required:
       • `.in_("id", ids)`         — the forwarded subtree allow-list, and
       • `.eq("client_id", org_id)` — the server-derived org of the AUTHENTICATED
-        user. This second predicate is the tenant boundary: a forged allow-list
-        containing another org's note ids matches zero rows here, so retrieval can
-        never cross orgs even though the service-role client bypasses RLS.
+        user. This is the tenant boundary: a forged allow-list containing another
+        org's note ids matches zero rows here, so retrieval can never cross orgs
+        even though the service-role client bypasses RLS.
+      • `.or_(is_user_context.eq.false, user_id.eq.<user>)` — PERSONAL overlay
+        notes must belong to THIS user. Shared node notes (is_user_context=false)
+        pass for anyone in the org; a personal note only passes when it is the
+        authenticated user's own. So a forged allow-list can't surface another
+        user's private "Your context" notes even within the same org.
     """
     ids = [str(i) for i in allowed_note_ids if i][:_MAX_NOTES]
-    if not ids or not org_id:
+    if not ids or not org_id or not user_id:
         return []
     result = (
         sb.schema(_SCHEMA)
         .table(_TABLE)
-        .select("id, path, description, content, internal_summary, context_node_id")
+        .select(
+            "id, path, description, content, internal_summary, context_node_id, is_user_context"
+        )
         .in_("id", ids)
         .eq("client_id", org_id)
+        .or_(f"is_user_context.eq.false,user_id.eq.{user_id}")
         .execute()
     )
     return result.data or []
@@ -371,22 +379,26 @@ def consult_memory(query: str, **kwargs) -> str:
     # ── STEP 3: fetch note bodies (allow-list ∩ org) ────────────────────────────
     t_fetch = time.monotonic()
     try:
-        notes = _fetch_allowed_notes(sb, allowed_note_ids, org_id)
+        notes = _fetch_allowed_notes(sb, allowed_note_ids, org_id, user_id)
     except Exception as e:
         logger.exception(
             f"[consult_memory:{cid}] note fetch failed (total_ms={_ms_since(t0)})", error=str(e)
         )
         return json.dumps({"error": f"Failed to fetch memory: {e}"}, ensure_ascii=False)
 
-    # Per-note manifest: which notes were actually pulled (id, title, size, whether
-    # it's the auto AI-memory note). This is the line to check when an answer is
-    # missing a fact — you can see if the note was even in scope + fetched.
+    # Per-note manifest: which notes were actually pulled (id, title, owning node,
+    # size, and whether it's a PERSONAL "Your context" note). This is the line to
+    # check when an answer is missing a fact — you can see if the note was even in
+    # scope + fetched. `dropped` = allow-listed ids that the org/user predicates
+    # filtered out (should be 0 in a healthy single-user, single-org run; a
+    # non-zero value means the allow-list contained out-of-tenant/other-user ids).
     manifest = [
         {
             "id": n.get("id"),
             "title": n.get("path") or "(untitled)",
             "node": n.get("context_node_id"),
             "chars": len((n.get("content") or "")),
+            "personal": bool(n.get("is_user_context")),
         }
         for n in notes[:50]
     ]
@@ -394,6 +406,8 @@ def consult_memory(query: str, **kwargs) -> str:
         f"[consult_memory:{cid}] STEP 3 notes fetched",
         allowed=len(allowed_note_ids),
         fetched=len(notes),
+        dropped=len(allowed_note_ids) - len(notes),
+        personal_fetched=sum(1 for n in notes if n.get("is_user_context")),
         fetch_ms=_ms_since(t_fetch),
         manifest=manifest,
     )
