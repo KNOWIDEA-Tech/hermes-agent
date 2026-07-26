@@ -146,8 +146,43 @@ def _get_supabase():
     return create_client(url, key)
 
 
+def _has_active_membership(sb, user_id: str, org_id: str) -> bool:
+    """True when the user holds a live `app.memberships` row in `org_id`.
+
+    FAILS CLOSED: any error is treated as "not a member", so a transient DB
+    problem downgrades the caller to their home org rather than granting access.
+    """
+    try:
+        result = (
+            sb.schema(_SCHEMA)
+            .table("memberships")
+            .select("id")
+            .eq("user_id", user_id)
+            .eq("org_id", org_id)
+            .eq("status", "active")
+            .limit(1)
+            .execute()
+        )
+        return bool(result.data)
+    except Exception as e:  # pragma: no cover - network/db dependent
+        logger.error("[consult_memory] membership check failed", error=str(e))
+        return False
+
+
 def _resolve_user_org(sb, user_id: str) -> Optional[str]:
-    """The authenticated user's org (`app.users.client_id`), derived server-side.
+    """The org this turn ACTS UNDER, derived server-side from the trusted user_id.
+
+    Must agree with whoever built the allow-list, or the two filters intersect to
+    nothing. The web app (app/api/chat/memory/route.ts) scopes the memory graph to
+    `getActiveMembership().orgId ?? user.clientId` — the user's SELECTED org
+    (`users.active_org_id`), falling back to their home org (`users.client_id`).
+    Re-scoping on raw client_id here would silently return zero notes for any user
+    whose active org differs from their home org.
+
+    The selection is honored the same way the Custom Access Token Hook honors it —
+    ONLY when it corresponds to a live membership. `active_org_id` is user-writable,
+    so trusting it unconditionally would let a removed member keep reading their old
+    org's notes; validating it is what makes this a scoping fix and not a hole.
 
     Keyed by the trusted user_id contextvar — NOT `memory_context.org_id` (which is
     client-supplied and therefore unusable as a security filter). Returns None if it
@@ -159,14 +194,26 @@ def _resolve_user_org(sb, user_id: str) -> Optional[str]:
         result = (
             sb.schema(_SCHEMA)
             .table("users")
-            .select("client_id")
+            .select("client_id, active_org_id")
             .eq("id", user_id)
             .limit(1)
             .execute()
         )
         rows = result.data or []
-        if rows:
-            return rows[0].get("client_id")
+        if not rows:
+            return None
+        home_org = rows[0].get("client_id")
+        active_org = rows[0].get("active_org_id")
+
+        if active_org and active_org != home_org:
+            if _has_active_membership(sb, user_id, active_org):
+                return active_org
+            logger.warning(
+                "[consult_memory] active_org_id has no live membership — "
+                "falling back to home org",
+                user_id=user_id,
+            )
+        return home_org
     except Exception as e:  # pragma: no cover - network/db dependent
         logger.error("[consult_memory] failed to resolve user org", error=str(e))
     return None
@@ -202,7 +249,18 @@ def _fetch_allowed_notes(
         authenticated user's own. So a forged allow-list can't surface another
         user's private "Your context" notes even within the same org.
     """
-    ids = [str(i) for i in allowed_note_ids if i][:_MAX_NOTES]
+    requested = [str(i) for i in allowed_note_ids if i]
+    ids = requested[:_MAX_NOTES]
+    if len(requested) > len(ids):
+        # Silently dropping ids makes a partial answer indistinguishable from a
+        # complete one — the sub-agent would report "nothing relevant" for a note
+        # that was simply never fetched.
+        logger.warning(
+            "[consult_memory] allow-list truncated at the cap",
+            requested=len(requested),
+            used=len(ids),
+            cap=_MAX_NOTES,
+        )
     if not ids or not org_id or not user_id:
         return []
     result = (
@@ -223,18 +281,32 @@ def _build_notes_block(notes: List[Dict[str, Any]]) -> str:
     """Render fetched notes into a bounded plaintext block for the sub-agent."""
     parts: List[str] = []
     total = 0
-    for note in notes:
+    bodies_truncated = 0
+    notes_dropped = 0
+    for idx, note in enumerate(notes):
         body = (note.get("content") or "").strip()
         if not body:
             continue
         if len(body) > _MAX_NOTE_CHARS:
             body = body[: _MAX_NOTE_CHARS - 20].rstrip() + "\n...[truncated]"
+            bodies_truncated += 1
         title = note.get("path") or "(untitled)"
         chunk = f"### {title}\n{body}"
         if total + len(chunk) > _MAX_TOTAL_CHARS:
+            # Everything from here on is omitted, not just this one note.
+            notes_dropped = len(notes) - idx
             break
         parts.append(chunk)
         total += len(chunk)
+
+    if notes_dropped or bodies_truncated:
+        logger.warning(
+            "[consult_memory] note corpus truncated — sub-agent sees a partial view",
+            notes_dropped=notes_dropped,
+            bodies_truncated=bodies_truncated,
+            included=len(parts),
+            total_notes=len(notes),
+        )
     return "\n\n".join(parts).strip()
 
 
