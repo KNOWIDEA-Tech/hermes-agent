@@ -374,12 +374,17 @@ class TestIterationBudgetOwnership:
             content="Done", finish_reason="stop"
         )
         result = _run(agent)
-        # The tool loop never runs (remaining == 0); the ONE call made is the
-        # pre-existing salvage summary, identifiable by its injected request.
+        # The tool loop never runs (remaining == 0). The ONE call made is the
+        # graceful finish: tools withdrawn, and asked for the ANSWER rather
+        # than a recap of a process that never happened. (A parent starved by
+        # its own subagents still has all their findings in context, so this
+        # call is what turns them into an answer instead of a dead turn.)
         assert agent.client.chat.completions.create.call_count == 1
         only_call = agent.client.chat.completions.create.call_args
-        assert "maximum number of tool-calling iterations" in only_call.kwargs["messages"][-1]["content"]
+        assert only_call.kwargs["tools"] is None
+        assert "Answer the user's original question NOW" in only_call.kwargs["messages"][-1]["content"]
         assert result["api_calls"] == 0
+        assert result["finish_reason"] == "session_budget"
         assert shared.used == 1  # unchanged — nothing consumed by this run
 
 

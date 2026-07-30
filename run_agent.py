@@ -202,6 +202,56 @@ class IterationBudget:
             return max(0, self.max_total - self._used)
 
 
+# Share of a budget held back so the run can always afford to WRITE its answer.
+# Every budget in this loop (iterations, spend, wall-clock) stops EXPLORATION at
+# 1 - this, then spends the remainder on a tool-less finishing phase.
+FINISH_RESERVE_FRACTION = 0.15
+
+# Tools withdrawn once a run is under budget pressure. delegate_task spawns a
+# whole child agent that draws on the SAME shared IterationBudget and has been
+# observed running 300s+ — starting one near the wall guarantees the parent is
+# starved before it can answer. Withdrawn early so the pressure warning has
+# something to actually enforce; the data tools always survive.
+_EXPANSION_TOOLS = frozenset({"delegate_task"})
+
+# What the model is told when a budget runs out. This is the single most
+# load-bearing string in the exit path: the previous wording ("summarize what
+# you've found and accomplished so far") asked about the agent's PROCESS, so
+# production capped turns shipped 600-1700 chars of methodology narration with
+# none of the structured blocks the UI needs. Restate the QUESTION, demand the
+# ANSWER, and say nothing about iteration budgets — an internal accounting
+# detail the reader never asked about.
+_DEFAULT_FINISH_INSTRUCTION = (
+    "You have used this turn's full research budget, and your tools are now "
+    "switched off — any further tool call will fail.\n\n"
+    "Answer the user's original question NOW, in full, from the information you "
+    "have already gathered above.\n\n"
+    "The user's question was:\n{question}\n\n"
+    "Write the ANSWER, not an account of your process. Do not describe what you "
+    "did, do not apologize, and do not mention limits, budgets or tooling — none "
+    "of that is what was asked. Follow every output-format rule in your system "
+    "prompt exactly, including any required structured blocks. If some part of "
+    "the analysis is genuinely unfinished, give the strongest answer your data "
+    "supports and state the one specific gap in a short closing line."
+)
+
+# Same contract, but the cost path keeps the words "spend limit" so the
+# distinct exit stays greppable in logs and telemetry.
+_COST_FINISH_INSTRUCTION = (
+    "This run has reached its spend limit, and your tools are now switched off "
+    "— any further tool call will fail.\n\n"
+    "Answer the user's original question NOW, in full, from the information you "
+    "have already gathered above.\n\n"
+    "The user's question was:\n{question}\n\n"
+    "Write the ANSWER, not an account of your process. Do not describe what you "
+    "did, do not apologize, and do not mention limits, budgets or tooling. "
+    "Follow every output-format rule in your system prompt exactly, including "
+    "any required structured blocks. If some part of the analysis is genuinely "
+    "unfinished, give the strongest answer your data supports and state the one "
+    "specific gap in a short closing line."
+)
+
+
 class CostBudget:
     """Thread-safe shared USD spend ceiling for parent and child agents.
 
@@ -253,6 +303,19 @@ class CostBudget:
     def exceeded(self) -> bool:
         with self._lock:
             return self._spent_usd >= self.max_usd
+
+    def near_exhausted(self, reserve_fraction: float = FINISH_RESERVE_FRACTION) -> bool:
+        """True once spend crosses the ceiling MINUS a reserve for the finish.
+
+        ``exceeded`` fires at 100%, but the run still has to pay for one more
+        call to write the answer — so the old exit went over the ceiling it
+        existed to enforce, and did it with a stub. Stopping tool calls a
+        little early keeps the answer inside the budget.
+        """
+        if self.max_usd <= 0:
+            return False
+        with self._lock:
+            return self._spent_usd >= self.max_usd * (1.0 - reserve_fraction)
 
 
 # Tools that must never run concurrently (interactive / user-facing).
@@ -475,6 +538,9 @@ class AIAgent:
         checkpoints_enabled: bool = False,
         checkpoint_max_snapshots: int = 50,
         pass_session_id: bool = False,
+        soft_deadline_seconds: float | None = None,
+        finish_reserve_iterations: int = 3,
+        finish_instruction: str | None = None,
     ):
         """
         Initialize the AI Agent.
@@ -538,6 +604,36 @@ class AIAgent:
         # doesn't opt in). Children inherit the parent's budget via
         # delegate_task so subagent spend counts against the same ceiling.
         self.cost_budget = cost_budget
+        # ── Graceful finish ───────────────────────────────────────────────
+        # Exhausting a budget must never end the turn on a stub. When one runs
+        # out the loop enters a FINISHING phase instead of breaking: tools are
+        # withdrawn, the original question and output contract are restated,
+        # and the answer is written from inside the same loop — so it still
+        # streams, still honors the response format, and still reports as a
+        # completed turn.
+        #
+        # soft_deadline_seconds bounds the thing users actually feel. The
+        # iteration count was only ever a proxy for latency, and a bad one: a
+        # 60-call turn can be 3 minutes or 12. None = no deadline (default;
+        # every existing caller is unchanged).
+        self.soft_deadline_seconds = (
+            float(soft_deadline_seconds) if soft_deadline_seconds else None
+        )
+        self.finish_reserve_iterations = max(1, int(finish_reserve_iterations))
+        # Optional caller-supplied template ("{question}" is substituted). The
+        # chat surface uses this to restate its widget/followups contract.
+        self.finish_instruction = finish_instruction
+        self._finishing = False        # tools withdrawn, answer-only
+        self._finish_reason = None     # iterations | session_budget | deadline | cost
+        self._restricted_tools = False  # expansion tools withdrawn early
+        self._turn_started_monotonic = None
+        # run_conversation restarts the deadline clock on every call, which is
+        # right for a multi-turn CLI session and WRONG for a caller that runs
+        # the same agent twice for ONE user turn (hermes's recovery re-prompt).
+        # Set this to keep the clock running across those calls, so an 8-minute
+        # promise stays 8 minutes instead of quietly becoming 16. Mirrors the
+        # reason CostBudget is caller-owned rather than per-run_conversation.
+        self.pin_turn_deadline = False
         self.tool_delay = tool_delay
         self.save_trajectories = save_trajectories
         self.verbose_logging = verbose_logging
@@ -4099,6 +4195,25 @@ class AIAgent:
         base = (getattr(self, "base_url", "") or "").lower()
         return "dashscope" in base or "aliyuncs" in base
 
+    def _active_tools(self) -> Optional[List[Dict[str, Any]]]:
+        """The tool surface for the NEXT call, after budget pressure is applied.
+
+        Telling a model "no more tool calls" in prose is a request; removing the
+        tools is a guarantee. The finishing phase depends on the guarantee — a
+        model that spends its finishing call on one more query has no budget
+        left to write anything.
+        """
+        if self._finishing:
+            return None
+        if not self.tools:
+            return self.tools
+        if not self._restricted_tools:
+            return self.tools
+        return [
+            t for t in self.tools
+            if (t.get("function", {}) or {}).get("name") not in _EXPANSION_TOOLS
+        ] or None
+
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
         if self.api_mode == "anthropic_messages":
@@ -4107,7 +4222,7 @@ class AIAgent:
             return build_anthropic_kwargs(
                 model=self.model,
                 messages=anthropic_messages,
-                tools=self.tools,
+                tools=self._active_tools(),
                 max_tokens=self.max_tokens,
                 reasoning_config=self.reasoning_config,
                 is_oauth=getattr(self, "_is_anthropic_oauth", False),
@@ -4141,7 +4256,10 @@ class AIAgent:
                 "model": self.model,
                 "instructions": instructions,
                 "input": self._chat_messages_to_responses_input(payload_messages),
-                "tools": self._responses_tools(),
+                # `or []` so a withdrawn surface reads as EMPTY, not as
+                # "unspecified" (which _responses_tools would fill from
+                # self.tools, handing the tools straight back).
+                "tools": self._responses_tools(self._active_tools() or []),
                 "tool_choice": "auto",
                 "parallel_tool_calls": True,
                 "store": False,
@@ -4219,10 +4337,11 @@ class AIAgent:
         if self.provider_data_collection:
             provider_preferences["data_collection"] = self.provider_data_collection
 
+        _tools = self._active_tools()
         api_kwargs = {
             "model": self.model,
             "messages": sanitized_messages,
-            "tools": self.tools if self.tools else None,
+            "tools": _tools if _tools else None,
             "timeout": httpx.Timeout(
                 connect=15.0,
                 read=float(os.getenv("HERMES_API_TIMEOUT", 300.0)),
@@ -4956,6 +5075,9 @@ class AIAgent:
             messages.append(tool_msg)
 
         # ── Budget pressure injection ────────────────────────────────────
+        # Withdraw the expansion tools at the warning tier — the prose nudge
+        # below is a request, this is the part that binds.
+        self._apply_budget_pressure(api_call_count)
         budget_warning = self._get_budget_warning(api_call_count)
         if budget_warning and messages and messages[-1].get("role") == "tool":
             last_content = messages[-1]["content"]
@@ -4969,9 +5091,9 @@ class AIAgent:
             except (json.JSONDecodeError, TypeError):
                 messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
             if not self.quiet_mode:
-                remaining = self.max_iterations - api_call_count
-                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
-                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+                _progress, _binding, _hint = self._budget_progress(api_call_count)
+                tier = "⚠️  WARNING" if _progress >= self._budget_warning_threshold else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {_hint} (binding budget: {_binding})")
 
     def _execute_tool_calls_sequential(self, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0) -> None:
         """Execute tool calls sequentially (original behavior). Used for single calls or interactive tools."""
@@ -5234,6 +5356,9 @@ class AIAgent:
         # After all tool calls in this turn are processed, check if we're
         # approaching max_iterations. If so, inject a warning into the LAST
         # tool result's JSON so the LLM sees it naturally when reading results.
+        # Withdraw the expansion tools at the warning tier — the prose nudge
+        # below is a request, this is the part that binds.
+        self._apply_budget_pressure(api_call_count)
         budget_warning = self._get_budget_warning(api_call_count)
         if budget_warning and messages and messages[-1].get("role") == "tool":
             last_content = messages[-1]["content"]
@@ -5247,33 +5372,166 @@ class AIAgent:
             except (json.JSONDecodeError, TypeError):
                 messages[-1]["content"] = last_content + f"\n\n{budget_warning}"
             if not self.quiet_mode:
-                remaining = self.max_iterations - api_call_count
-                tier = "⚠️  WARNING" if remaining <= self.max_iterations * 0.1 else "💡 CAUTION"
-                print(f"{self.log_prefix}{tier}: {remaining} iterations remaining")
+                _progress, _binding, _hint = self._budget_progress(api_call_count)
+                tier = "⚠️  WARNING" if _progress >= self._budget_warning_threshold else "💡 CAUTION"
+                print(f"{self.log_prefix}{tier}: {_hint} (binding budget: {_binding})")
+
+    def _elapsed_seconds(self) -> float:
+        """Wall-clock seconds since this turn began (0.0 before it starts)."""
+        if self._turn_started_monotonic is None:
+            return 0.0
+        return max(0.0, time.monotonic() - self._turn_started_monotonic)
+
+    def _deadline_progress(self) -> Optional[float]:
+        """Fraction of the soft wall-clock deadline used, or None if unset."""
+        if not self.soft_deadline_seconds:
+            return None
+        return self._elapsed_seconds() / self.soft_deadline_seconds
+
+    def _budget_progress(self, api_call_count: int) -> tuple[float, str, str]:
+        """How close this turn is to ANY of its budgets.
+
+        Returns (progress 0-1, binding budget name, human remaining-hint).
+
+        Every budget is measured, and the tightest one wins. The old version
+        looked only at ``api_call_count / max_iterations``, which is the one
+        counter a starved parent does NOT move: when a delegate_task subagent
+        drained the SHARED IterationBudget, the parent sat at 2/60, saw no
+        pressure at all, and was then hard-stopped mid-run. That is the
+        "running fine, then just stops" report.
+        """
+        best = (0.0, "iterations", "")
+
+        def _consider(progress, name, hint):
+            nonlocal best
+            if progress > best[0]:
+                best = (progress, name, hint)
+
+        if self.max_iterations > 0:
+            left = self.max_iterations - api_call_count
+            _consider(
+                api_call_count / self.max_iterations,
+                "iterations",
+                f"{left} of your {self.max_iterations} research step(s) left",
+            )
+        ib = self.iteration_budget
+        if ib is not None and ib.max_total > 0:
+            _consider(
+                ib.used / ib.max_total,
+                "session_budget",
+                f"{ib.remaining} of {ib.max_total} shared research step(s) left "
+                "(you and your subagents draw on the same pool)",
+            )
+        cb = self.cost_budget
+        if cb is not None and cb.max_usd > 0:
+            _consider(cb.spent_usd / cb.max_usd, "cost", "this run's spend limit is close")
+        dp = self._deadline_progress()
+        if dp is not None:
+            left = max(0, int(self.soft_deadline_seconds - self._elapsed_seconds()))
+            _consider(dp, "deadline", f"about {left}s of this turn's time left")
+        return best
 
     def _get_budget_warning(self, api_call_count: int) -> Optional[str]:
         """Return a budget pressure string, or None if not yet needed.
 
-        Two-tier system:
+        Two-tier system, measured against whichever budget is tightest:
           - Caution (70%): nudge to consolidate work
           - Warning (90%): urgent, must respond now
         """
-        if not self._budget_pressure_enabled or self.max_iterations <= 0:
+        if not self._budget_pressure_enabled:
             return None
-        progress = api_call_count / self.max_iterations
-        remaining = self.max_iterations - api_call_count
+        progress, _name, hint = self._budget_progress(api_call_count)
         if progress >= self._budget_warning_threshold:
             return (
-                f"[BUDGET WARNING: Iteration {api_call_count}/{self.max_iterations}. "
-                f"Only {remaining} iteration(s) left. "
-                "Provide your final response NOW. No more tool calls unless absolutely critical.]"
+                f"[BUDGET WARNING: {hint}. Your tools are about to be switched "
+                "off. Stop exploring and write your final answer NOW — make any "
+                "genuinely essential remaining read a SINGLE batched call.]"
             )
         if progress >= self._budget_caution_threshold:
             return (
-                f"[BUDGET: Iteration {api_call_count}/{self.max_iterations}. "
-                f"{remaining} iterations left. Start consolidating your work.]"
+                f"[BUDGET: {hint}. Start consolidating. Batch anything you still "
+                "need into one query rather than several small ones.]"
             )
         return None
+
+    def _apply_budget_pressure(self, api_call_count: int) -> None:
+        """Withdraw the expansion tools once pressure reaches the warning tier.
+
+        Latching (never un-set within a turn) so a refund can't hand delegation
+        back at iteration 58.
+        """
+        if self._restricted_tools or not self._budget_pressure_enabled:
+            return
+        progress, _name, _hint = self._budget_progress(api_call_count)
+        if progress >= self._budget_warning_threshold:
+            self._restricted_tools = True
+            self._vprint(
+                f"{self.log_prefix}🚧 Budget pressure — withdrawing "
+                f"{', '.join(sorted(_EXPANSION_TOOLS))} for the rest of this turn"
+            )
+
+    def _exhaustion_reason(self, api_call_count: int) -> Optional[str]:
+        """Which budget (if any) is spent. None means keep exploring."""
+        cb = self.cost_budget
+        if cb is not None and cb.near_exhausted():
+            return "cost"
+        if self.max_iterations > 0 and api_call_count >= self.max_iterations:
+            return "iterations"
+        if self.iteration_budget is not None and self.iteration_budget.remaining <= 0:
+            return "session_budget"
+        dp = self._deadline_progress()
+        if dp is not None and dp >= 1.0:
+            return "deadline"
+        return None
+
+    def _enter_finishing(self, messages: list, reason: str, question: str) -> None:
+        """Switch the run from exploring to answering.
+
+        NOT a break. The loop continues with tools withdrawn, so the answer is
+        written by the same streaming call path as any other turn — the old
+        exit dropped to a separate non-streamed completion, which is why the UI
+        went dead at exactly the moment the user was waiting hardest.
+        """
+        if self._finishing:
+            return
+        self._finishing = True
+        self._finish_reason = reason
+        self._restricted_tools = True
+        template = self.finish_instruction or (
+            _COST_FINISH_INSTRUCTION if reason == "cost" else _DEFAULT_FINISH_INSTRUCTION
+        )
+        try:
+            body = template.format(question=(question or "").strip())
+        except (KeyError, IndexError, ValueError):
+            # A caller-supplied template with stray braces must not break the
+            # one exit path that exists to prevent broken answers.
+            body = template
+        # Normally the last message is a tool result, so a user turn appends
+        # cleanly. But a run that starts already out of budget (a subagent
+        # drained the shared pool before the parent's first call) still has the
+        # user's own message last — and back-to-back user turns are rejected
+        # outright by strict role-alternation APIs. Merge instead of append.
+        if messages and messages[-1].get("role") == "user":
+            messages[-1]["content"] = f"{messages[-1].get('content', '')}\n\n{body}".strip()
+        else:
+            messages.append({"role": "user", "content": body})
+        self._vprint(
+            f"{self.log_prefix}🏁 Budget spent ({reason}) after "
+            f"{self._elapsed_seconds():.0f}s — withdrawing tools and writing the answer",
+            force=True,
+        )
+        cb = self.cost_budget
+        logger.warning(
+            "graceful finish: reason=%s elapsed=%.1fs iters_shared=%s/%s "
+            "spent=%s max=%s model=%s",
+            reason,
+            self._elapsed_seconds(),
+            getattr(self.iteration_budget, "used", "?"),
+            getattr(self.iteration_budget, "max_total", "?"),
+            f"{cb.spent_usd:.4f}" if cb is not None else "n/a",
+            f"{cb.max_usd:.4f}" if cb is not None else "n/a",
+            self.model,
+        )
 
     def _emit_context_pressure(self, compaction_progress: float, compressor) -> None:
         """Notify the user that context is approaching the compaction threshold.
@@ -5322,22 +5580,28 @@ class AIAgent:
         ceiling was crossed). Both exits are identical otherwise: one final
         no-tools call that summarizes the work done so far.
         """
+        # NOTE: these prompts ask for the ANSWER, not an account of the work.
+        # The previous wording ("summarize what you've found and accomplished so
+        # far") is why capped production turns shipped methodology prose with
+        # none of the structured blocks the caller's format required.
         if reason == "cost":
-            print(f"💸 Spend ceiling reached after {api_call_count} API calls. Requesting summary...")
+            print(f"💸 Spend ceiling reached after {api_call_count} API calls. Requesting the answer...")
             summary_request = (
-                "This run has reached its spend limit. "
-                "Please provide a final response summarizing what you've found and accomplished so far, "
-                "without calling any more tools."
+                "This run has reached its spend limit and your tools are switched off. "
+                "Answer the user's original question now, in full, from what you have "
+                "already gathered — the answer itself, not a description of your process, "
+                "and following every output-format rule in your system prompt."
             )
-            _fallback_msg = "I hit this run's spend limit and couldn't generate a summary."
+            _fallback_msg = "I hit this run's spend limit before I could finish this answer."
         else:
-            print(f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary...")
+            print(f"⚠️  Budget spent after {api_call_count} API calls. Requesting the answer...")
             summary_request = (
-                "You've reached the maximum number of tool-calling iterations allowed. "
-                "Please provide a final response summarizing what you've found and accomplished so far, "
-                "without calling any more tools."
+                "Your research budget for this turn is spent and your tools are switched off. "
+                "Answer the user's original question now, in full, from what you have "
+                "already gathered — the answer itself, not a description of your process, "
+                "and following every output-format rule in your system prompt."
             )
-            _fallback_msg = "I reached the iteration limit and couldn't generate a summary."
+            _fallback_msg = "I ran out of budget before I could finish this answer."
         messages.append({"role": "user", "content": summary_request})
 
         def _meter_summary_usage(resp) -> None:
@@ -5762,6 +6026,15 @@ class AIAgent:
         final_response = None
         interrupted = False
         cost_limited = False
+        # Graceful-finish state is per-TURN, so a reused agent (the chat
+        # recovery re-prompt runs on the same object) never starts pre-finished
+        # with its tools already gone.
+        self._finishing = False
+        self._finish_reason = None
+        self._restricted_tools = False
+        if not self.pin_turn_deadline or self._turn_started_monotonic is None:
+            self._turn_started_monotonic = time.monotonic()
+        finish_calls = 0
         codex_ack_continuations = 0
         length_continue_retries = 0
         truncated_response_prefix = ""
@@ -5770,7 +6043,29 @@ class AIAgent:
         # Clear any stale interrupt state at start
         self.clear_interrupt()
         
-        while api_call_count < self.max_iterations and self.iteration_budget.remaining > 0:
+        # The loop no longer ends when a budget runs out — it switches to
+        # FINISHING (tools withdrawn, question restated) and writes the answer
+        # from in here. Only the finishing reserve, an interrupt, or a delivered
+        # answer ends it.
+        while True:
+            # ── Budget gate ───────────────────────────────────────────────
+            if not self._finishing:
+                _reason = self._exhaustion_reason(api_call_count)
+                if _reason:
+                    # A run that starts already over its SPEND ceiling (e.g. a
+                    # recovery re-prompt on the same agent) must not pay for
+                    # even one more call — there is nothing gathered to write up.
+                    if _reason == "cost" and api_call_count == 0:
+                        cost_limited = True
+                        break
+                    self._enter_finishing(messages, _reason, original_user_message)
+                    if _reason == "cost":
+                        cost_limited = True
+            if self._finishing:
+                if finish_calls >= self.finish_reserve_iterations:
+                    break
+                finish_calls += 1
+
             # Reset per-turn checkpoint dedup so each iteration can take one snapshot
             self._checkpoint_mgr.new_turn()
 
@@ -5781,33 +6076,14 @@ class AIAgent:
                     self._safe_print(f"\n⚡ Breaking out of tool loop due to interrupt...")
                 break
 
-            # Hard per-run spend ceiling (shared with subagents via CostBudget).
-            # Checked BEFORE each API call so a run that crossed the ceiling on
-            # its last call stops here instead of paying for another full
-            # iteration. Exits to the same summary path as the iteration cap.
-            if self.cost_budget is not None and self.cost_budget.exceeded:
-                cost_limited = True
-                self._vprint(
-                    f"\n{self.log_prefix}💸 Spend ceiling reached: "
-                    f"${self.cost_budget.spent_usd:.2f} >= ${self.cost_budget.max_usd:.2f} "
-                    f"(including subagents) after {api_call_count} API calls — "
-                    f"stopping tool calls and summarizing.",
-                    force=True,
-                )
-                logger.warning(
-                    "Cost budget exceeded: spent=%.4f max=%.4f api_calls=%s model=%s",
-                    self.cost_budget.spent_usd,
-                    self.cost_budget.max_usd,
-                    api_call_count,
-                    self.model,
-                )
-                break
-
-            api_call_count += 1
-            if not self.iteration_budget.consume():
-                if not self.quiet_mode:
-                    self._safe_print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.max_total} total across agent + subagents)")
-                break
+            if not self._finishing:
+                api_call_count += 1
+                if not self.iteration_budget.consume():
+                    # The shared pool drained between the gate above and here
+                    # (a subagent finishing concurrently). Finish, don't die.
+                    api_call_count -= 1
+                    self._enter_finishing(messages, "session_budget", original_user_message)
+                    finish_calls += 1
 
             # Fire step_callback for gateway hooks (agent:step event)
             if self.step_callback is not None:
@@ -6680,6 +6956,15 @@ class AIAgent:
                         self._vprint(f"{self.log_prefix}❌ Max retries ({max_retries}) exceeded. Giving up.", force=True)
                         logging.error(f"{self.log_prefix}API call failed after {max_retries} retries. Last error: {api_error}")
                         logging.error(f"{self.log_prefix}Request details - Messages: {len(api_messages)}, Approx tokens: {approx_tokens:,}")
+                        # This raise escapes run_conversation entirely (the outer
+                        # handler starts below the retry loop). That is fine
+                        # while exploring, but during the FINISHING phase it
+                        # would turn a graceful degradation into a hard error
+                        # for the caller — the exact guarantee this phase
+                        # exists to provide. Leave `response` as None instead
+                        # and let the tail's one-shot salvage answer.
+                        if self._finishing:
+                            break
                         raise api_error
 
                     wait_time = min(2 ** retry_count, 60)  # Exponential backoff: 2s, 4s, 8s, 16s, 32s, 60s, 60s
@@ -6713,8 +6998,13 @@ class AIAgent:
                 break
 
             if restart_with_compressed_messages:
-                api_call_count -= 1
-                self.iteration_budget.refund()
+                # A finishing call never charged the counters (its cost is the
+                # finish reserve), so refunding one here would credit budget it
+                # never spent — and could hand a drained shared pool back to a
+                # subagent. Only un-charge what was actually charged.
+                if not self._finishing:
+                    api_call_count -= 1
+                    self.iteration_budget.refund()
                 continue
 
             if restart_with_length_continuation:
@@ -6870,6 +7160,21 @@ class AIAgent:
                 elif hasattr(self, "_codex_incomplete_retries"):
                     self._codex_incomplete_retries = 0
                 
+                # Tools are withdrawn during the finishing phase, but a few
+                # providers still echo a tool call from the prior turn's cached
+                # prefix. Running it would spend the reserve that exists to
+                # write the answer, so drop the calls and keep whatever text
+                # came with them (the empty-content retry below covers the rest).
+                if self._finishing and assistant_message.tool_calls:
+                    self._vprint(
+                        f"{self.log_prefix}🚧 Ignoring {len(assistant_message.tool_calls)} "
+                        "tool call(s) echoed after tools were withdrawn"
+                    )
+                    # Cleared BEFORE the branch below, so the no-tool-calls path
+                    # appends one clean assistant message (the append happens
+                    # further down — nothing is in `messages` to repair yet).
+                    assistant_message.tool_calls = None
+
                 # Check for tool calls
                 if assistant_message.tool_calls:
                     if not self.quiet_mode:
@@ -7216,6 +7521,17 @@ class AIAgent:
                             }
                             messages.append(empty_msg)
 
+                            # In the finishing phase this early return WAS the
+                            # production "empty answer, status=complete" bug:
+                            # it skips the salvage fallback and the
+                            # graceful-finish fields the caller needs to tell a
+                            # truncation from a clean turn. Fall through to the
+                            # normal tail instead, which still has one bounded
+                            # summary call left to rescue an answer.
+                            if self._finishing:
+                                final_response = None
+                                break
+
                             self._cleanup_task_resources(effective_task_id)
                             self._persist_session(messages, conversation_history)
 
@@ -7320,6 +7636,14 @@ class AIAgent:
                 # message pollutes history, burns tokens, and risks violating
                 # role-alternation invariants.
 
+                # The finishing call itself failed upstream. Break WITHOUT
+                # setting a response so the tail's last-resort salvage runs and
+                # produces the budget-appropriate message — an "I encountered
+                # repeated errors" string here would mask which budget ended
+                # the turn (the cost path must still say "spend limit").
+                if self._finishing:
+                    break
+
                 # If we're near the limit, break to avoid infinite loops
                 if api_call_count >= self.max_iterations - 1:
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
@@ -7328,34 +7652,44 @@ class AIAgent:
                     messages.append({"role": "assistant", "content": final_response})
                     break
         
-        if final_response is None and cost_limited:
-            if api_call_count > 0:
-                # One final bounded no-tools call to salvage an answer from the
-                # work already paid for.
-                final_response = self._handle_max_iterations(messages, api_call_count, reason="cost")
-            else:
-                # The budget was already exhausted when this run started (e.g. a
-                # recovery re-prompt on the same agent) — don't spend even the
-                # summary call.
-                final_response = (
-                    "This run was stopped before it started because its spend "
-                    "limit was already reached."
+        budget_finished = self._finishing
+        # Did the FINISHING phase itself write the answer, or did it come up
+        # empty and leave us on the salvage fallback below? Only the former is
+        # a genuinely finished turn.
+        finish_delivered = budget_finished and bool((final_response or "").strip())
+        if final_response is None and cost_limited and api_call_count == 0:
+            # The ceiling was already spent when this run started (e.g. a
+            # recovery re-prompt on the same agent) — nothing was gathered, so
+            # don't pay for a write-up of nothing.
+            final_response = (
+                "This run was stopped before it started because its spend "
+                "limit was already reached."
+            )
+        elif final_response is None and budget_finished:
+            # The finishing phase spent its whole reserve without producing
+            # content (a model that answers with nothing but reasoning, say).
+            # Last resort: the original one-shot salvage call.
+            if not self.quiet_mode:
+                print(
+                    f"\n⚠️  Finishing reserve exhausted ({self._finish_reason}); "
+                    "falling back to a one-shot summary"
                 )
-        elif final_response is None and (
-            api_call_count >= self.max_iterations
-            or self.iteration_budget.remaining <= 0
-        ):
-            if self.iteration_budget.remaining <= 0 and not self.quiet_mode:
-                print(f"\n⚠️  Session iteration budget exhausted ({self.iteration_budget.used}/{self.iteration_budget.max_total} used, including subagents)")
-            final_response = self._handle_max_iterations(messages, api_call_count)
-        
+            final_response = self._handle_max_iterations(
+                messages, api_call_count,
+                reason="cost" if self._finish_reason == "cost" else "iterations",
+            )
+
         # Determine if conversation completed successfully.
-        # Note: cost-limited runs deliberately report completed=True (the
-        # salvage summary is a usable final answer, and completed=True
-        # suppresses client-side whole-turn retries that would re-spend the
-        # budget). Consumers must check `cost_limited` to detect truncation —
-        # unlike iteration-capped runs, which report completed=False.
-        completed = final_response is not None and api_call_count < self.max_iterations
+        #
+        # A turn that hit a budget but then DELIVERED a real answer is complete.
+        # It used to report completed=False, which sent every capped turn
+        # through hermes's recovery re-prompt for a second full write-up — the
+        # 61-66 api_calls tail in the 2026-07-30 production forensics. Consumers
+        # that care about truncation read `budget_finished`/`finish_reason`
+        # (and `cost_limited`), not `completed`.
+        completed = bool((final_response or "").strip()) and (
+            not budget_finished or finish_delivered
+        )
 
         # Save trajectory if enabled
         self._save_trajectory(messages, user_message, completed)
@@ -7406,6 +7740,16 @@ class AIAgent:
             # True when the run was stopped by the CostBudget spend ceiling
             # (final_response is then a summary of the work done so far).
             "cost_limited": cost_limited,
+            # True when a budget ran out and the turn switched to the tool-less
+            # finishing phase. This — not `completed` — is the truncation
+            # signal: a budget_finished turn that DELIVERED still reports
+            # completed=True, because it holds a real answer.
+            "budget_finished": budget_finished,
+            # Which budget bound the turn: iterations | session_budget |
+            # deadline | cost. None on a healthy turn.
+            "finish_reason": self._finish_reason,
+            # Wall-clock seconds this turn spent in the agent loop.
+            "elapsed_seconds": round(self._elapsed_seconds(), 2),
         }
         self._response_was_previewed = False
         
