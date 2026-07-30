@@ -4196,23 +4196,45 @@ class AIAgent:
         return "dashscope" in base or "aliyuncs" in base
 
     def _active_tools(self) -> Optional[List[Dict[str, Any]]]:
-        """The tool surface for the NEXT call, after budget pressure is applied.
+        """The tool surface for the NEXT call.
 
         Telling a model "no more tool calls" in prose is a request; removing the
         tools is a guarantee. The finishing phase depends on the guarantee — a
         model that spends its finishing call on one more query has no budget
         left to write anything.
+
+        This is the ONLY place the tool array changes during a turn, and that is
+        deliberate. Tools render first in the Anthropic cache prefix, so every
+        change to this array invalidates the whole cached conversation — on a
+        150k-token context roughly the size of the finish reserve itself. An
+        earlier revision ALSO dropped the expansion tools at the 90% tier, which
+        meant two invalidations per pressured turn and could push spend back
+        over the ceiling the reserve exists to protect. Expansion tools are now
+        blocked at EXECUTION time instead (see `_expansion_tool_refusal`), which
+        stops the expensive branch just as hard and costs no cache.
         """
         if self._finishing:
             return None
-        if not self.tools:
-            return self.tools
-        if not self._restricted_tools:
-            return self.tools
-        return [
-            t for t in self.tools
-            if (t.get("function", {}) or {}).get("name") not in _EXPANSION_TOOLS
-        ] or None
+        return self.tools
+
+    def _expansion_tool_refusal(self, function_name: str) -> Optional[str]:
+        """Refuse an expansion tool once the turn is under budget pressure.
+
+        delegate_task spawns a child agent that draws on the SAME shared
+        IterationBudget and has been observed running 300s+; starting one next
+        to the wall guarantees the parent is starved before it can answer.
+        Refusing the CALL (rather than hiding the tool) keeps the cached prompt
+        prefix intact — see `_active_tools`.
+        """
+        if not self._restricted_tools or function_name not in _EXPANSION_TOOLS:
+            return None
+        return (
+            f"Tool '{function_name}' is unavailable for the rest of this turn: "
+            "the research budget is nearly spent and delegating would consume "
+            "what is left before an answer could be written. Do not retry it. "
+            "Finish the analysis yourself with the data you already have, "
+            "batching any remaining read into a SINGLE query."
+        )
 
     def _build_api_kwargs(self, api_messages: list) -> dict:
         """Build the keyword arguments dict for the active API mode."""
@@ -4846,6 +4868,10 @@ class AIAgent:
         tools. Used by the concurrent execution path; the sequential path retains
         its own inline invocation for backward-compatible display handling.
         """
+        _refused = self._expansion_tool_refusal(function_name)
+        if _refused:
+            return _refused
+
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
             return _todo_tool(
@@ -5173,7 +5199,14 @@ class AIAgent:
 
             tool_start_time = time.time()
 
-            if function_name == "todo":
+            # Budget-pressure gate, mirroring the concurrent path in
+            # _invoke_tool. Checked before dispatch so the refusal reaches the
+            # model as an ordinary tool result.
+            _refused = self._expansion_tool_refusal(function_name)
+            if _refused:
+                self._vprint(f"{self.log_prefix}🚧 {function_name} refused — budget nearly spent")
+                function_result = _refused
+            elif function_name == "todo":
                 from tools.todo_tool import todo_tool as _todo_tool
                 function_result = _todo_tool(
                     todos=function_args.get("todos"),
@@ -5424,7 +5457,15 @@ class AIAgent:
             )
         cb = self.cost_budget
         if cb is not None and cb.max_usd > 0:
-            _consider(cb.spent_usd / cb.max_usd, "cost", "this run's spend limit is close")
+            # Measured against the point where EXPLORATION stops, not the raw
+            # ceiling. Exploration stops at near_exhausted (85%), so scoring
+            # this dimension out of 100% put the 90% warning tier BEYOND the
+            # point of no return: a cost-bound run went from CAUTION at 70%
+            # straight to tools-gone, and never saw "write your answer NOW".
+            # Every other dimension's 1.0 already means "this is where I stop",
+            # so this normalization is what makes them comparable.
+            _stop_at = cb.max_usd * (1.0 - FINISH_RESERVE_FRACTION)
+            _consider(cb.spent_usd / _stop_at, "cost", "this run's spend limit is close")
         dp = self._deadline_progress()
         if dp is not None:
             left = max(0, int(self.soft_deadline_seconds - self._elapsed_seconds()))
@@ -5471,18 +5512,35 @@ class AIAgent:
             )
 
     def _exhaustion_reason(self, api_call_count: int) -> Optional[str]:
-        """Which budget (if any) is spent. None means keep exploring."""
+        """Which budget (if any) is spent. None means keep exploring.
+
+        When more than one is spent, `cost` is reported ONLY if it is the sole
+        reason or spend actually crossed the ceiling. Checking cost first
+        labelled a turn that had run out of iterations AND was merely 86% spent
+        as `cost` — and hermes skips the recovery re-prompt on cost_limited
+        turns, so that mislabel silently cost them recovery they used to get.
+
+        The asymmetry is deliberate rather than a "furthest past its stop point"
+        rule: iteration progress can never exceed 1.0 (the loop stops exactly at
+        the cap) while cost runs on to ~1.17 of its stop point, so a numeric
+        max would hand almost every tie to cost and re-create the bug.
+        `cost_limited` should mean spend is what stopped this turn.
+        """
+        spent = []
         cb = self.cost_budget
-        if cb is not None and cb.near_exhausted():
-            return "cost"
+        cost_spent = cb is not None and cb.near_exhausted()
         if self.max_iterations > 0 and api_call_count >= self.max_iterations:
-            return "iterations"
+            spent.append("iterations")
         if self.iteration_budget is not None and self.iteration_budget.remaining <= 0:
-            return "session_budget"
+            spent.append("session_budget")
         dp = self._deadline_progress()
         if dp is not None and dp >= 1.0:
-            return "deadline"
-        return None
+            spent.append("deadline")
+        if cost_spent and (not spent or cb.exceeded):
+            return "cost"
+        if spent:
+            return spent[0]
+        return "cost" if cost_spent else None
 
     def _enter_finishing(self, messages: list, reason: str, question: str) -> None:
         """Switch the run from exploring to answering.
@@ -5500,19 +5558,23 @@ class AIAgent:
         template = self.finish_instruction or (
             _COST_FINISH_INSTRUCTION if reason == "cost" else _DEFAULT_FINISH_INSTRUCTION
         )
-        try:
-            body = template.format(question=(question or "").strip())
-        except (KeyError, IndexError, ValueError):
-            # A caller-supplied template with stray braces must not break the
-            # one exit path that exists to prevent broken answers.
-            body = template
+        # str.replace, not str.format: a caller template containing any other
+        # brace (JSON examples are common in output contracts) made .format
+        # raise, and the except-fallback then shipped the template with a
+        # LITERAL "{question}" in it. replace can't raise and degrades to
+        # "placeholder simply not present" in the worst case.
+        body = template.replace("{question}", (question or "").strip())
         # Normally the last message is a tool result, so a user turn appends
         # cleanly. But a run that starts already out of budget (a subagent
         # drained the shared pool before the parent's first call) still has the
         # user's own message last — and back-to-back user turns are rejected
         # outright by strict role-alternation APIs. Merge instead of append.
-        if messages and messages[-1].get("role") == "user":
-            messages[-1]["content"] = f"{messages[-1].get('content', '')}\n\n{body}".strip()
+        # The isinstance guard matters for multimodal turns: a user message can
+        # carry a LIST of content blocks, and f-string-ing that would stringify
+        # the list into the prompt.
+        _last = messages[-1] if messages else None
+        if _last and _last.get("role") == "user" and isinstance(_last.get("content"), str):
+            _last["content"] = f"{_last['content']}\n\n{body}".strip()
         else:
             messages.append({"role": "user", "content": body})
         self._vprint(
@@ -6039,6 +6101,10 @@ class AIAgent:
         length_continue_retries = 0
         truncated_response_prefix = ""
         compression_attempts = 0
+        # Set when the answer is still truncated after 3 continuation attempts.
+        # Exits via the shared tail (not an inline return) so the result keeps
+        # the graceful-finish fields and the usage counters.
+        partial_truncated = False
         
         # Clear any stale interrupt state at start
         self.clear_interrupt()
@@ -6435,17 +6501,18 @@ class AIAgent:
                                     restart_with_length_continuation = True
                                     break
 
-                                partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
-                                self._cleanup_task_resources(effective_task_id)
-                                self._persist_session(messages, conversation_history)
-                                return {
-                                    "final_response": partial_response or None,
-                                    "messages": messages,
-                                    "api_calls": api_call_count,
-                                    "completed": False,
-                                    "partial": True,
-                                    "error": "Response remained truncated after 3 continuation attempts",
-                                }
+                                # A budget-finished turn whose answer then
+                                # truncated is the single most interesting shape
+                                # for validating the graceful finish — and this
+                                # hand-built dict carried none of the fields that
+                                # would show it (budget_finished, finish_reason,
+                                # cost_limited, every usage/cost counter), so
+                                # such a turn logged as a healthy one and its
+                                # spend never reached the usage log. Break out to
+                                # the shared tail, which builds the full result
+                                # and ships the accumulated text.
+                                partial_truncated = True
+                                break
 
                         # If we have prior messages, roll back to last complete state
                         if len(messages) > 1:
@@ -7005,7 +7072,23 @@ class AIAgent:
                 if not self._finishing:
                     api_call_count -= 1
                     self.iteration_budget.refund()
+                else:
+                    # A compression restart produced no answer text — the call
+                    # failed on context length and is being retried. Charging a
+                    # reserve slot for it would spend the answer's budget on
+                    # overhead, and the finishing phase (which appends a long
+                    # instruction to an already-large context) is exactly where
+                    # a compression restart is most likely.
+                    finish_calls = max(0, finish_calls - 1)
                 continue
+
+            if partial_truncated:
+                # 3 continuation attempts and the answer is still being cut off.
+                # Ship what the model actually wrote rather than a fresh recap;
+                # the tail records it as an incomplete turn.
+                final_response = self._strip_think_blocks(truncated_response_prefix).strip() or None
+                truncated_response_prefix = ""
+                break
 
             if restart_with_length_continuation:
                 continue
@@ -7666,18 +7749,38 @@ class AIAgent:
                 "limit was already reached."
             )
         elif final_response is None and budget_finished:
-            # The finishing phase spent its whole reserve without producing
-            # content (a model that answers with nothing but reasoning, say).
-            # Last resort: the original one-shot salvage call.
-            if not self.quiet_mode:
-                print(
-                    f"\n⚠️  Finishing reserve exhausted ({self._finish_reason}); "
-                    "falling back to a one-shot summary"
+            # The reserve ran out before the answer was assembled.
+            #
+            # If the finishing call(s) DID stream real answer text that was cut
+            # off by the output cap, that text is sitting in
+            # truncated_response_prefix — already generated and already paid
+            # for. Shipping a truncated real answer beats throwing it away and
+            # buying a fresh from-scratch summary, which is what this used to
+            # do (the model's own words, discarded, replaced by a recap).
+            _salvaged = self._strip_think_blocks(truncated_response_prefix).strip()
+            if _salvaged:
+                if not self.quiet_mode:
+                    print(
+                        f"\n⚠️  Finishing reserve exhausted ({self._finish_reason}) "
+                        "mid-answer; shipping the answer text already generated"
+                    )
+                final_response = _salvaged
+                truncated_response_prefix = ""
+                # Real content the model wrote for THIS question — a delivered
+                # (if clipped) answer, not a fallback stub.
+                finish_delivered = True
+            else:
+                # Nothing usable was generated (e.g. a model that answers with
+                # reasoning only). Last resort: the one-shot salvage call.
+                if not self.quiet_mode:
+                    print(
+                        f"\n⚠️  Finishing reserve exhausted ({self._finish_reason}); "
+                        "falling back to a one-shot summary"
+                    )
+                final_response = self._handle_max_iterations(
+                    messages, api_call_count,
+                    reason="cost" if self._finish_reason == "cost" else "iterations",
                 )
-            final_response = self._handle_max_iterations(
-                messages, api_call_count,
-                reason="cost" if self._finish_reason == "cost" else "iterations",
-            )
 
         # Determine if conversation completed successfully.
         #
@@ -7687,8 +7790,10 @@ class AIAgent:
         # 61-66 api_calls tail in the 2026-07-30 production forensics. Consumers
         # that care about truncation read `budget_finished`/`finish_reason`
         # (and `cost_limited`), not `completed`.
-        completed = bool((final_response or "").strip()) and (
-            not budget_finished or finish_delivered
+        completed = (
+            bool((final_response or "").strip())
+            and (not budget_finished or finish_delivered)
+            and not partial_truncated
         )
 
         # Save trajectory if enabled
@@ -7719,7 +7824,10 @@ class AIAgent:
             "messages": messages,
             "api_calls": api_call_count,
             "completed": completed,
-            "partial": False,  # True only when stopped due to invalid tool calls
+            # True when the answer was still being cut off by the output cap
+            # after 3 continuation attempts. (The invalid-tool-call stop returns
+            # inline above and sets its own partial=True.)
+            "partial": partial_truncated,
             "interrupted": interrupted,
             "response_previewed": getattr(self, "_response_was_previewed", False),
             "model": self.model,
@@ -7751,6 +7859,8 @@ class AIAgent:
             # Wall-clock seconds this turn spent in the agent loop.
             "elapsed_seconds": round(self._elapsed_seconds(), 2),
         }
+        if partial_truncated:
+            result["error"] = "Response remained truncated after 3 continuation attempts"
         self._response_was_previewed = False
         
         # Include interrupt message if one triggered the interrupt

@@ -268,17 +268,48 @@ class TestSharedBudgetStarvation:
         assert result["finish_reason"] == "session_budget"
         assert _calls(agent)[-1].kwargs["tools"] is None
 
-    def test_delegate_task_is_withdrawn_under_pressure(self):
+    def test_delegate_task_is_refused_under_pressure(self):
         """Near the wall, don't let the run start a fresh 300s subagent branch."""
         agent = _make_agent(max_iterations=10)
         agent._apply_budget_pressure(api_call_count=9)
-        names = {t["function"]["name"] for t in (agent._active_tools() or [])}
 
-        assert "delegate_task" not in names, (
-            "delegation drains the shared pool and starts a long branch — it "
-            "must be withdrawn before the budget runs out, not after"
+        refusal = agent._expansion_tool_refusal("delegate_task")
+        assert refusal is not None
+        assert "unavailable for the rest of this turn" in refusal
+        assert agent._expansion_tool_refusal("web_search") is None, (
+            "the data tools must survive"
         )
-        assert "web_search" in names, "the data tools must survive"
+
+    def test_pressure_does_not_change_the_tool_array(self):
+        """Blocking delegation must not cost a prompt-cache invalidation.
+
+        Tools render first in the Anthropic cache prefix, so changing the array
+        invalidates the whole cached conversation — on a large context that is
+        about the size of the finish reserve itself. Exactly ONE tool-surface
+        change is allowed per turn, at the finishing boundary.
+        """
+        agent = _make_agent(max_iterations=10)
+        before = agent._active_tools()
+        agent._apply_budget_pressure(api_call_count=9)
+
+        assert agent._restricted_tools is True, "pressure was applied"
+        assert agent._active_tools() == before, (
+            "the tool array must be byte-identical under pressure; the "
+            "expansion tools are blocked at execution time instead"
+        )
+
+    def test_refusal_reaches_the_model_as_a_tool_result(self):
+        """A refused delegation must come back as an ordinary tool result.
+
+        If it raised or returned empty the model would have no idea why its
+        call vanished, and would likely just retry it.
+        """
+        agent = _make_agent(max_iterations=10)
+        agent._restricted_tools = True
+        out = agent._invoke_tool("delegate_task", {"goal": "go wide"}, "task-1")
+
+        assert "unavailable" in out
+        assert "Do not retry it" in out
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +374,56 @@ class TestSoftDeadline:
 # ---------------------------------------------------------------------------
 
 
+class TestReserveSpentMidAnswer:
+    """Review #13.1/#13.4 — text the model already generated must never be
+    thrown away and replaced with a fresh recap."""
+
+    def _length_capped(self, chunks):
+        """Responses that keep getting cut off by the output cap."""
+        it = iter(chunks)
+
+        def _respond(**kwargs):
+            if kwargs.get("tools"):
+                return _tool_turn()
+            return _mock_response(content=next(it), finish_reason="length")
+        return _respond
+
+    def test_reserve_running_out_mid_answer_ships_the_real_text(self):
+        agent = _make_agent(max_iterations=1, finish_reserve_iterations=2)
+        agent.client.chat.completions.create.side_effect = self._length_capped(
+            ["REAL ANSWER PART 1 ", "REAL ANSWER PART 2 ", "x", "x", "x"]
+        )
+        with patch("run_agent.handle_function_call", return_value="tool output"):
+            result = _run(agent, "what is revenue?")
+
+        assert "REAL ANSWER PART 1" in (result["final_response"] or ""), (
+            "the model's own answer text was discarded in favour of a "
+            "from-scratch summary — the one path where 'a good answer never "
+            "gets cut off' did not hold"
+        )
+        assert result["budget_finished"] is True
+
+    def test_truncated_turn_still_reports_the_graceful_finish_fields(self):
+        """The 3-continuations early return used to bypass the shared tail.
+
+        A budget-finished turn whose answer then truncated is the single most
+        interesting shape for validating this fix, and it was the one that
+        logged as a healthy turn.
+        """
+        agent = _make_agent(max_iterations=1, finish_reserve_iterations=5)
+        agent.client.chat.completions.create.side_effect = self._length_capped(
+            ["A", "B", "C", "D", "E"]
+        )
+        with patch("run_agent.handle_function_call", return_value="tool output"):
+            result = _run(agent)
+
+        assert "budget_finished" in result
+        assert "finish_reason" in result
+        assert "cost_limited" in result
+        assert result["partial"] is True
+        assert result["completed"] is False
+
+
 class TestCostReserve:
     def test_near_exhausted_reserves_room_for_the_finish(self):
         b = CostBudget(6.0)
@@ -357,3 +438,35 @@ class TestCostReserve:
 
     def test_zero_ceiling_never_trips(self):
         assert CostBudget(0.0).near_exhausted() is False
+
+    def test_the_warning_tier_fires_before_tools_are_taken_away(self):
+        """Review #13.2 — the 90% warning was unreachable on the cost budget.
+
+        near_exhausted stops exploration at 85%, so scoring cost out of the
+        raw ceiling put the 90% tier PAST the point of no return: the run went
+        from CAUTION at 70% straight to tools-gone, never seeing "write your
+        final answer NOW".
+        """
+        budget = CostBudget(6.0)
+        agent = _make_agent(max_iterations=1000, cost_budget=budget)
+        budget.add(4.90)  # 81.7% of the ceiling — under the 85% stop
+
+        assert budget.near_exhausted() is False, "still exploring"
+        warning = agent._get_budget_warning(api_call_count=0)
+        assert warning is not None and "BUDGET WARNING" in warning, (
+            "the urgent tier must be reachable while tools still exist"
+        )
+
+    def test_the_most_overrun_budget_is_the_one_reported(self):
+        """Review #13.6 — cost was checked first and mislabelled the reason.
+
+        A turn out of iterations AND 86% spent was reported as `cost`, and
+        hermes skips the recovery re-prompt on cost-limited turns — so the
+        mislabel silently cost those turns recovery they used to get.
+        """
+        budget = CostBudget(6.0)
+        budget.add(5.15)  # 86% — just past the stop, barely
+        agent = _make_agent(max_iterations=10, cost_budget=budget)
+
+        # Iterations are 100% spent; cost is only just over its stop point.
+        assert agent._exhaustion_reason(api_call_count=10) == "iterations"
