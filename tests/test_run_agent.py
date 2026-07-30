@@ -1972,18 +1972,18 @@ class TestBudgetPressure:
         msg = agent._get_budget_warning(42)
         assert msg is not None
         assert "[BUDGET:" in msg
-        assert "18 iterations left" in msg
+        assert "18 of your 60 research step(s) left" in msg
 
     def test_warning_at_90_percent(self, agent):
         agent.max_iterations = 60
         msg = agent._get_budget_warning(54)
         assert "[BUDGET WARNING:" in msg
-        assert "Provide your final response NOW" in msg
+        assert "write your final answer NOW" in msg
 
     def test_last_iteration(self, agent):
         agent.max_iterations = 60
         msg = agent._get_budget_warning(59)
-        assert "1 iteration(s) left" in msg
+        assert "1 of your 60 research step(s) left" in msg
 
     def test_disabled(self, agent):
         agent.max_iterations = 60
