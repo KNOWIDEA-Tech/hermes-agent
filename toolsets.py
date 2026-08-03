@@ -219,8 +219,13 @@ TOOLSETS = {
     },
 
     "memory_consult": {
-        "description": "On-demand hierarchical notes retrieval (Company/Team/Project notes) via a scoped sub-agent — available only on notes-context turns",
-        "tools": ["consult_memory"],
+        "description": "Hierarchical memory retrieval (Company/Team/Project notes) — available only on memory-context turns. read_company_context/read_team_context return FULL company/team bodies; read_project_note returns a FULL project note by id (guided by the Project Notes Index in the prompt). No truncation.",
+        # consult_memory (distilling sub-agent) intentionally NOT exposed here: the
+        # dynamic-memory-fetch design returns FULL, untruncated note bodies via the
+        # read_* tools instead of a lossy distilled summary. consult_memory stays
+        # registered but off the exposed toolset; re-add if a distilled overview is
+        # ever wanted alongside the raw reads.
+        "tools": ["read_company_context", "read_team_context", "read_project_note"],
         "includes": []
     },
 
