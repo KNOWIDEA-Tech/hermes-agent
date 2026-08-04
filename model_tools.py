@@ -160,6 +160,7 @@ def _discover_tools():
         "tools.homeassistant_tool",
         "tools.user_notes_tool",
         "tools.memory_consult_tool",
+        "tools.memory_read_tool",
     ]
     import importlib
     for mod_name in _modules:
