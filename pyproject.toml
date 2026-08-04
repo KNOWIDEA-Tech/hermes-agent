@@ -14,6 +14,8 @@ dependencies = [
   # Core — pinned to known-good ranges to limit supply chain attack surface
   "openai>=2.21.0,<3",
   "anthropic>=0.39.0,<1",
+  # Observability — Logfire is opt-in (no-ops without LOGFIRE_TOKEN)
+  "logfire>=4.0.0,<5",
   "python-dotenv>=1.2.1,<2",
   "fire>=0.7.1,<1",
   "httpx>=0.28.1,<1",

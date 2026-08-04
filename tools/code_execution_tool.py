@@ -423,6 +423,20 @@ def execute_code(
     if not sandbox_tools:
         sandbox_tools = SANDBOX_ALLOWED_TOOLS
 
+    # Log the full code snippet to Logfire (nests under the tool.execute_code
+    # span). Best-effort: a logging failure must never block execution.
+    try:
+        from agent import observability as _obs
+        _obs.info(
+            "code_execution.code",
+            tags=["tool", "code-exec"],
+            code=code,
+            code_chars=len(code),
+            tools=",".join(sorted(sandbox_tools)),
+        )
+    except Exception:
+        pass
+
     # --- Set up temp directory with hermes_tools.py and script.py ---
     tmpdir = tempfile.mkdtemp(prefix="hermes_sandbox_")
     # Use /tmp on macOS to avoid the long /var/folders/... path that pushes
@@ -688,6 +702,19 @@ def execute_code(
             if stderr_text:
                 result["output"] = stdout_text + "\n--- stderr ---\n" + stderr_text
 
+        try:
+            from agent import observability as _obs
+            _obs.info(
+                "code_execution.result",
+                tags=["tool", "code-exec"],
+                status=result["status"],
+                duration_seconds=result["duration_seconds"],
+                tool_calls_made=result["tool_calls_made"],
+                output_chars=len(result.get("output", "")),
+            )
+        except Exception:
+            pass
+
         return json.dumps(result, ensure_ascii=False)
 
     except Exception as exc:
@@ -700,6 +727,18 @@ def execute_code(
             exc,
             exc_info=True,
         )
+        try:
+            from agent import observability as _obs
+            _obs.info(
+                "code_execution.result",
+                tags=["tool", "code-exec"],
+                status="error",
+                duration_seconds=duration,
+                tool_calls_made=tool_call_counter[0],
+                output_chars=0,
+            )
+        except Exception:
+            pass
         return json.dumps({
             "status": "error",
             "error": str(exc),

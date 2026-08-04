@@ -33,3 +33,6 @@ croniter
 python-telegram-bot>=20.0
 discord.py>=2.0
 aiohttp>=3.9.0
+
+# Optional: Observability (Logfire). No-ops unless LOGFIRE_TOKEN is set.
+logfire>=4.0.0,<5
