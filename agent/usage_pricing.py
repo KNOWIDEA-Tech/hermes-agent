@@ -494,9 +494,22 @@ def normalize_usage(
         input_tokens = max(0, prompt_total - cache_read_tokens - cache_write_tokens)
 
     reasoning_tokens = 0
-    output_details = getattr(response_usage, "output_tokens_details", None)
-    if output_details:
-        reasoning_tokens = _to_int(getattr(output_details, "reasoning_tokens", 0))
+    # Responses API shape (`output_tokens_details`) AND the Chat Completions
+    # shape (`completion_tokens_details`) — OpenRouter uses the latter, so
+    # reading only the former reported reasoning_tokens=0 on every OpenRouter
+    # turn while thinking tokens were silently folded into output_tokens.
+    for _attr in ("output_tokens_details", "completion_tokens_details"):
+        details = getattr(response_usage, _attr, None)
+        if details is None and isinstance(response_usage, dict):
+            details = response_usage.get(_attr)
+        if not details:
+            continue
+        rt = getattr(details, "reasoning_tokens", None)
+        if rt is None and isinstance(details, dict):
+            rt = details.get("reasoning_tokens")
+        if rt:
+            reasoning_tokens = _to_int(rt)
+            break
 
     return CanonicalUsage(
         input_tokens=input_tokens,

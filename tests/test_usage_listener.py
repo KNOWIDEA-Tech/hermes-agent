@@ -198,3 +198,40 @@ def test_listener_shared_across_concurrent_agents_receives_all_deltas():
     assert len(deltas) == 2
     assert sorted(d["input_tokens"] for d in deltas) == [100, 101]
     assert all(d["output_tokens"] == 50 and d["cost_usd"] == 0.05 for d in deltas)
+
+
+# ── reasoning_tokens: Chat Completions shape (OpenRouter) ─────────────────────
+
+def test_normalize_usage_reads_reasoning_from_completion_tokens_details():
+    """OpenRouter (Chat Completions) reports thinking under
+    `completion_tokens_details.reasoning_tokens`; only the Responses-API name
+    (`output_tokens_details`) was read, so every OpenRouter turn logged
+    reasoning_tokens=0 while thinking was folded into output_tokens."""
+    from types import SimpleNamespace
+
+    from agent.usage_pricing import normalize_usage
+
+    usage = SimpleNamespace(
+        prompt_tokens=1000,
+        completion_tokens=5757,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=0, cache_write_tokens=0),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=5000),
+    )
+    cu = normalize_usage(usage, provider="openrouter", api_mode="chat_completions")
+    assert cu.output_tokens == 5757
+    assert cu.reasoning_tokens == 5000
+
+
+def test_normalize_usage_still_reads_the_responses_api_shape():
+    from types import SimpleNamespace
+
+    from agent.usage_pricing import normalize_usage
+
+    usage = SimpleNamespace(
+        input_tokens=100,
+        output_tokens=50,
+        input_tokens_details=SimpleNamespace(cached_tokens=0),
+        output_tokens_details=SimpleNamespace(reasoning_tokens=20),
+    )
+    cu = normalize_usage(usage, provider="openai", api_mode="codex_responses")
+    assert cu.reasoning_tokens == 20

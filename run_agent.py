@@ -746,6 +746,16 @@ class AIAgent:
         self._budget_caution_threshold = 0.7   # 70% — nudge to start wrapping up
         self._budget_warning_threshold = 0.9   # 90% — urgent, respond now
         self._budget_pressure_enabled = True
+        # Optional caller hook: (tier, hint) -> extra text appended to the
+        # budget warning, or None. `tier` is "caution" or "warning". Lets the
+        # caller make the pressure text DELIVERABLE-aware: the generic "write
+        # your final answer NOW" is exactly the wrong instruction on a turn
+        # whose deliverable is a file the model has not built yet — observed
+        # live 2026-09-14: a 19-call, $4 file turn obeyed the 90% warning,
+        # wrote prose, and delivered nothing. The hook is consulted on every
+        # warning so it can check live state (e.g. whether a file exists yet).
+        # Any exception in the hook is swallowed — pressure text is advisory.
+        self.budget_warning_hook = None
 
         # Context pressure warnings: notify the USER (not the LLM) as context
         # fills up.  Purely informational — displayed in CLI output and sent via
@@ -5483,17 +5493,32 @@ class AIAgent:
             return None
         progress, _name, hint = self._budget_progress(api_call_count)
         if progress >= self._budget_warning_threshold:
-            return (
+            text = (
                 f"[BUDGET WARNING: {hint}. Your tools are about to be switched "
                 "off. Stop exploring and write your final answer NOW — make any "
                 "genuinely essential remaining read a SINGLE batched call.]"
             )
+            return self._with_budget_hook("warning", hint, text)
         if progress >= self._budget_caution_threshold:
-            return (
+            text = (
                 f"[BUDGET: {hint}. Start consolidating. Batch anything you still "
                 "need into one query rather than several small ones.]"
             )
+            return self._with_budget_hook("caution", hint, text)
         return None
+
+    def _with_budget_hook(self, tier: str, hint: str, text: str) -> str:
+        """Append the caller's deliverable-aware suffix (see budget_warning_hook)."""
+        hook = getattr(self, "budget_warning_hook", None)
+        if hook is None:
+            return text
+        try:
+            extra = hook(tier, hint)
+        except Exception:  # noqa: BLE001 — advisory text must never break the loop
+            return text
+        if extra:
+            return f"{text} {str(extra).strip()}"
+        return text
 
     def _apply_budget_pressure(self, api_call_count: int) -> None:
         """Withdraw the expansion tools once pressure reaches the warning tier.
