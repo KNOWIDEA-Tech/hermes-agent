@@ -412,3 +412,60 @@ class TestDelegateInheritance:
                 parent_agent=parent,
             )
         assert MockAgent.call_args.kwargs["cost_budget"] is budget
+
+
+# ── budget_warning_hook: deliverable-aware pressure text ─────────────────────
+
+def _agent_for_budget_warning(**overrides):
+    """A bare AIAgent shell with only the budget-pressure attributes populated."""
+    from run_agent import AIAgent
+
+    a = AIAgent.__new__(AIAgent)
+    a._budget_caution_threshold = 0.7
+    a._budget_warning_threshold = 0.9
+    a._budget_pressure_enabled = True
+    a.budget_warning_hook = None
+    a.max_iterations = 10
+    a.iteration_budget = None
+    a.cost_budget = None
+    a.soft_deadline_seconds = 0
+    for k, v in overrides.items():
+        setattr(a, k, v)
+    return a
+
+
+def test_budget_warning_hook_appends_its_text_at_both_tiers():
+    seen = []
+
+    def hook(tier, hint):
+        seen.append(tier)
+        return f"<{tier}-extra>"
+
+    a = _agent_for_budget_warning(budget_warning_hook=hook)
+    caution = a._get_budget_warning(7)   # 70%
+    warning = a._get_budget_warning(9)   # 90%
+    assert caution.startswith("[BUDGET:") and caution.endswith("<caution-extra>")
+    assert warning.startswith("[BUDGET WARNING:") and warning.endswith("<warning-extra>")
+    assert seen == ["caution", "warning"]
+
+
+def test_budget_warning_hook_is_advisory_and_never_breaks_the_loop():
+    def boom(tier, hint):
+        raise RuntimeError("hook exploded")
+
+    a = _agent_for_budget_warning(budget_warning_hook=boom)
+    text = a._get_budget_warning(9)
+    assert text.startswith("[BUDGET WARNING:")
+    # An empty/None return leaves the base text untouched.
+    a.budget_warning_hook = lambda tier, hint: None
+    assert a._get_budget_warning(9) == text
+    # No hook at all → identical text (back-compat for callers that never set it).
+    b = _agent_for_budget_warning()
+    assert b._get_budget_warning(9) == text
+
+
+def test_budget_warning_hook_is_not_consulted_below_the_caution_tier():
+    calls = []
+    a = _agent_for_budget_warning(budget_warning_hook=lambda t, h: calls.append(t))
+    assert a._get_budget_warning(2) is None
+    assert calls == []
