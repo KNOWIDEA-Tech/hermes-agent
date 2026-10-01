@@ -258,6 +258,71 @@ def _call(tool_name, args):
 _TERMINAL_BLOCKED_PARAMS = {"background", "check_interval", "pty"}
 
 
+
+# Environment variables a code-execution child may inherit from the parent
+# process. Identity (HERMES_USER_ID and friends) is deliberately NOT here: the
+# parent serves several requests concurrently, so its process-wide environment
+# holds whichever request wrote last. Per-request values arrive only through
+# set_sandbox_env().
+_CHILD_SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
+                            "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
+                            "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA",
+                            "SUPABASE_URL", "SNOWFLAKE_")
+_CHILD_SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
+                            "PASSWD", "AUTH", "PRIVATE")
+
+
+def build_child_env(sock_path: str) -> Dict[str, str]:
+    """Build the environment for a code-execution child process.
+
+    Model-authored code is untrusted. It inherits only non-secret basics from
+    the parent; anything whose name looks like a credential is withheld unless
+    a skill or the user explicitly registered it as a passthrough. No
+    process-wide credential is re-injected: a service-role database key or a
+    shared warehouse token in the child's environment would let one tenant's
+    prompt injection read every tenant's data. A host application that needs
+    the child to reach a backend passes a narrowly scoped value through
+    set_sandbox_env(), merged last.
+    """
+    try:
+        from tools.env_passthrough import is_env_passthrough as _is_passthrough
+    except Exception:
+        _is_passthrough = lambda _: False  # noqa: E731
+
+    child_env: Dict[str, str] = {}
+    for k, v in os.environ.items():
+        if _is_passthrough(k):
+            child_env[k] = v
+            continue
+        if any(s in k.upper() for s in _CHILD_SECRET_SUBSTRINGS):
+            continue
+        if any(k.startswith(p) for p in _CHILD_SAFE_ENV_PREFIXES):
+            child_env[k] = v
+    child_env["HERMES_RPC_SOCKET"] = sock_path
+    child_env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+    # Inject the user's configured timezone so datetime.now() in sandboxed
+    # code reflects the correct wall-clock time.
+    tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
+    if tz_name:
+        child_env["TZ"] = tz_name
+
+    # Per-request values set by the host in the executor thread. Applied last
+    # so they override anything above.
+    child_env.update(get_sandbox_env())
+
+    # Build PYTHONPATH after merging the sandbox env so the hermes-agent root
+    # and the per-execution HERMES_TMP_DIR (where host helpers such as
+    # sf_connect.py live) are both importable without sys.path tricks.
+    hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path_parts = [p for p in child_env.get("PYTHONPATH", "").split(os.pathsep) if p]
+    for entry in (child_env.get("HERMES_TMP_DIR", ""), hermes_root):
+        if entry and entry not in path_parts:
+            path_parts.insert(0, entry)
+    child_env["PYTHONPATH"] = os.pathsep.join(path_parts)
+    return child_env
+
+
 def _rpc_server_loop(
     server_sock: socket.socket,
     task_id: str,
@@ -464,79 +529,7 @@ def execute_code(
         rpc_thread.start()
 
         # --- Spawn child process ---
-        # Build a minimal environment for the child. We intentionally exclude
-        # API keys and tokens to prevent credential exfiltration from LLM-
-        # generated scripts. The child accesses tools via RPC, not direct API.
-        # Exception: env vars declared by loaded skills (via env_passthrough
-        # registry) or explicitly allowed by the user in config.yaml
-        # (terminal.env_passthrough) are passed through.
-        _SAFE_ENV_PREFIXES = ("PATH", "HOME", "USER", "LANG", "LC_", "TERM",
-                              "TMPDIR", "TMP", "TEMP", "SHELL", "LOGNAME",
-                              "XDG_", "PYTHONPATH", "VIRTUAL_ENV", "CONDA",
-                              "SUPABASE_URL", "SNOWFLAKE_", "HERMES_USER_ID")
-        _SECRET_SUBSTRINGS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL",
-                              "PASSWD", "AUTH")
-        try:
-            from tools.env_passthrough import is_env_passthrough as _is_passthrough
-        except Exception:
-            _is_passthrough = lambda _: False  # noqa: E731
-        child_env = {}
-        for k, v in os.environ.items():
-            # Passthrough vars (skill-declared or user-configured) always pass.
-            if _is_passthrough(k):
-                child_env[k] = v
-                continue
-            # Block vars with secret-like names.
-            if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
-                continue
-            # Allow vars with known safe prefixes.
-            if any(k.startswith(p) for p in _SAFE_ENV_PREFIXES):
-                child_env[k] = v
-        child_env["HERMES_RPC_SOCKET"] = sock_path
-        child_env["PYTHONDONTWRITEBYTECODE"] = "1"
-        # Supabase service role key is needed for the supabase-reader skill
-        # inside code execution. It's blocked by _SECRET_SUBSTRINGS so we
-        # inject it explicitly.
-        _supa_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-        if _supa_key:
-            child_env["SUPABASE_SERVICE_ROLE_KEY"] = _supa_key
-        # Snowflake programmatic access token is needed for data queries
-        # inside code execution. It's blocked by _SECRET_SUBSTRINGS so we
-        # inject it explicitly.
-        _sf_token = os.getenv("SNOWFLAKE_PROGRAMMATIC_ACCESS_TOKEN", "")
-        if _sf_token:
-            child_env["SNOWFLAKE_PROGRAMMATIC_ACCESS_TOKEN"] = _sf_token
-        # Ensure the hermes-agent root is importable in the sandbox so
-        # repo-root modules are available to child scripts.
-        _hermes_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        # Inject user's configured timezone so datetime.now() in sandboxed
-        # code reflects the correct wall-clock time.
-        _tz_name = os.getenv("HERMES_TIMEZONE", "").strip()
-        if _tz_name:
-            child_env["TZ"] = _tz_name
-        # Merge per-thread sandbox env (set by Modal concurrent handlers etc.)
-        # Applied last so it can override any of the above.
-        child_env.update(get_sandbox_env())
-
-        # Merge per-execution sandbox env vars (user ID, temp dir, Snowflake
-        # creds) set via set_sandbox_env() in the executor thread.
-        child_env.update(get_sandbox_env())
-
-        # Build PYTHONPATH AFTER merging sandbox env, so:
-        #  - hermes-agent root is always importable (repo modules)
-        #  - the per-execution HERMES_TMP_DIR is also importable, so the
-        #    agent can `import sf_connect` directly without manually doing
-        #    `sys.path.insert(0, os.environ["HERMES_TMP_DIR"])`. The
-        #    setup_sandbox helper drops sf_connect.py into that dir.
-        # This eliminates the "agent burns 5 turns on import retries before
-        # finally finding sf_connect" failure mode.
-        _existing_pp = child_env.get("PYTHONPATH", "")
-        _path_parts = [p for p in _existing_pp.split(os.pathsep) if p]
-        _user_tmp = child_env.get("HERMES_TMP_DIR", "")
-        for _entry in (_user_tmp, _hermes_root):
-            if _entry and _entry not in _path_parts:
-                _path_parts.insert(0, _entry)
-        child_env["PYTHONPATH"] = os.pathsep.join(_path_parts)
+        child_env = build_child_env(sock_path)
 
         proc = subprocess.Popen(
             [sys.executable, "script.py"],

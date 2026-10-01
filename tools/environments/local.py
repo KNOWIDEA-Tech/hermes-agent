@@ -130,14 +130,32 @@ def _build_provider_env_blocklist() -> frozenset:
 
 _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 
+# Any variable whose NAME looks like a credential is withheld from terminal
+# subprocesses unless it is explicitly passed through. The provider blocklist
+# above only knows the secrets Hermes itself manages; an embedding application
+# (database service keys, warehouse tokens, signing secrets) adds its own, and a
+# shell the model controls must not inherit them by default. Same rule as the
+# code-execution sandbox.
+_SECRET_NAME_MARKERS = (
+    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "PRIVATE",
+)
+
+
+def _looks_like_secret(name: str) -> bool:
+    upper = name.upper()
+    return any(marker in upper for marker in _SECRET_NAME_MARKERS)
+
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment.
+    """Filter secrets from a subprocess environment.
 
-    `_HERMES_FORCE_<VAR>` entries in ``extra_env`` opt a blocked variable back in
-    intentionally for callers that truly need it.  Vars registered via
-    :mod:`tools.env_passthrough` (skill-declared or user-configured) also
-    bypass the blocklist.
+    Inherited variables (``base_env``) are dropped when they are a Hermes-managed
+    provider secret or when their name looks like a credential. Explicit
+    ``extra_env`` entries are the caller's deliberate choice and are kept unless
+    they are provider secrets. `_HERMES_FORCE_<VAR>` entries in ``extra_env`` opt
+    a blocked variable back in intentionally for callers that truly need it.
+    Vars registered via :mod:`tools.env_passthrough` (skill-declared or
+    user-configured) also bypass both filters.
     """
     try:
         from tools.env_passthrough import is_env_passthrough as _is_passthrough
@@ -149,7 +167,9 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
-        if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
+        if _is_passthrough(key):
+            sanitized[key] = value
+        elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST and not _looks_like_secret(key):
             sanitized[key] = value
 
     for key, value in (extra_env or {}).items():
