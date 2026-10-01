@@ -17,6 +17,7 @@ Architecture:
 Platform: Linux / macOS only (Unix domain sockets). Disabled on Windows.
 """
 
+import contextvars
 import json
 import logging
 import os
@@ -38,24 +39,24 @@ logger = logging.getLogger(__name__)
 
 SANDBOX_AVAILABLE = sys.platform != "win32"
 
-# Thread-local storage for per-execution sandbox environment variables.
-# Each executor thread gets its own copy so concurrent requests in the
-# same Modal container don't interfere with each other.
-_thread_local = threading.local()
+# Per-request sandbox environment. A ContextVar, not threading.local: one
+# container serves several requests at once, and their tool calls run on pool
+# threads. Callers that hand work to another thread copy the context
+# (contextvars.copy_context().run), so the request's own environment follows
+# its tool calls and never another request's.
+_SANDBOX_ENV: "contextvars.ContextVar[Dict[str, str]]" = contextvars.ContextVar(
+    "hermes_sandbox_env", default={}
+)
 
 
-def set_sandbox_env(env: dict) -> None:
-    """Store per-execution env vars in thread-local storage.
-
-    Must be called inside the executor thread (threading.local is per-thread).
-    These vars are merged into the child subprocess environment by execute_code().
-    """
-    _thread_local.sandbox_env = env
+def set_sandbox_env(env: Dict[str, str]) -> None:
+    """Set the environment merged into code-execution children for this request."""
+    _SANDBOX_ENV.set(dict(env or {}))
 
 
-def get_sandbox_env() -> dict:
-    """Retrieve per-execution env vars from thread-local storage."""
-    return getattr(_thread_local, "sandbox_env", {})
+def get_sandbox_env() -> Dict[str, str]:
+    """This request's sandbox environment (empty when none was set)."""
+    return dict(_SANDBOX_ENV.get())
 
 
 # The 7 tools allowed inside the sandbox. The intersection of this list
@@ -75,26 +76,6 @@ DEFAULT_TIMEOUT = 300        # 5 minutes
 DEFAULT_MAX_TOOL_CALLS = 50
 MAX_STDOUT_BYTES = 50_000    # 50 KB
 MAX_STDERR_BYTES = 10_000    # 10 KB
-
-# ---------------------------------------------------------------------------
-# Thread-local sandbox environment
-# ---------------------------------------------------------------------------
-# Allows callers (e.g. Modal concurrent handlers) to inject per-execution
-# env vars into the child subprocess without mutating the process-global
-# os.environ. Each thread sets its own dict; the sandbox merges it in.
-
-_sandbox_tls = threading.local()
-
-
-def set_sandbox_env(env: Dict[str, str]) -> None:
-    """Set per-thread extra environment variables for sandbox child processes."""
-    _sandbox_tls.env = env
-
-
-def get_sandbox_env() -> Dict[str, str]:
-    """Get per-thread extra environment variables (empty dict if unset)."""
-    return getattr(_sandbox_tls, "env", {})
-
 
 def check_sandbox_requirements() -> bool:
     """Code execution sandbox requires a POSIX OS for Unix domain sockets."""
@@ -519,8 +500,11 @@ def execute_code(
         server_sock.listen(1)
 
         rpc_thread = threading.Thread(
-            target=_rpc_server_loop,
+            # Run the RPC server in a copy of this request's context so the
+            # tools it dispatches see this request's identity.
+            target=contextvars.copy_context().run,
             args=(
+                _rpc_server_loop,
                 server_sock, task_id, tool_call_log,
                 tool_call_counter, max_tool_calls, sandbox_tools,
             ),

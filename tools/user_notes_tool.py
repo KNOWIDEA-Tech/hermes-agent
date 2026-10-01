@@ -9,7 +9,9 @@ create, update, or delete any user-authored note.
 Security:
 - user_id is NEVER accepted as a tool parameter
 - Primary source: contextvar (coroutine-isolated, safe for concurrent requests)
-- Fallback: os.environ["HERMES_USER_ID"] (for subprocess sandbox compatibility)
+- No process-environment fallback: the process serves concurrent requests, so
+  its environment can hold another request's user. A missing context is
+  treated as "no user" and the tools refuse.
 - Database RLS enforces filtering via session variable as defense-in-depth
 - update_memory writes are additive-or-snapshotted: every edit records an
   app.agent_memory_edits provenance row so the web app can undo it.
@@ -38,9 +40,9 @@ def _get_user_id() -> Optional[str]:
     This is the programmatic firewall: the agent never supplies a user_id.
     It is injected server-side before the agent starts.
     
-    Priority:
-    1. contextvar (coroutine-isolated, safe for concurrent Modal requests)
-    2. os.environ (for code running in subprocess sandbox)
+    Read only from the request contextvar (isolated per request and carried
+    onto worker threads). Returns None when it is unset, so the tool refuses
+    rather than acting for whichever request last wrote the process env.
     """
     # Try contextvar first (isolated per coroutine)
     try:
@@ -50,9 +52,7 @@ def _get_user_id() -> Optional[str]:
             return user_id
     except ImportError:
         pass
-    
-    # Fallback to env var (for subprocess sandbox)
-    return os.environ.get("HERMES_USER_ID") or None
+    return None
 
 
 def _get_active_project_id() -> Optional[str]:
@@ -72,7 +72,7 @@ def _get_active_project_id() -> Optional[str]:
     except ImportError:
         pass
 
-    return os.environ.get("HERMES_ACTIVE_PROJECT_ID")
+    return None
 
 
 def _get_notes_context_node_id() -> Optional[str]:

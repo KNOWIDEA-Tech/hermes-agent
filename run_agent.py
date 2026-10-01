@@ -26,6 +26,7 @@ import base64
 import concurrent.futures
 import copy
 import hashlib
+import contextvars
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -1651,7 +1652,12 @@ class AIAgent:
                         except Exception:
                             pass
 
-        t = threading.Thread(target=_run_review, daemon=True, name="bg-review")
+        # Run the review in a copy of this request's context (identity, sandbox
+        # env), so any tool it calls acts for this request.
+        review_context = contextvars.copy_context()
+        t = threading.Thread(
+            target=lambda: review_context.run(_run_review), daemon=True, name="bg-review"
+        )
         t.start()
 
     def _apply_persist_user_message_override(self, messages: List[Dict]) -> None:
@@ -5050,7 +5056,11 @@ class AIAgent:
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 for i, (tc, name, args) in enumerate(parsed_calls):
-                    f = executor.submit(_run_tool, i, tc, name, args)
+                    # Each tool call runs in a COPY of this request's context so
+                    # per-request identity (user, org, sandbox env) follows it
+                    # onto the pool thread instead of falling back to
+                    # process-wide state shared with concurrent requests.
+                    f = executor.submit(contextvars.copy_context().run, _run_tool, i, tc, name, args)
                     futures.append(f)
 
                 # Wait for all to complete (exceptions are captured inside _run_tool)

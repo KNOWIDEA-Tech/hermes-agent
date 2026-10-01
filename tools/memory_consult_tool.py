@@ -114,7 +114,8 @@ def _get_user_id() -> Optional[str]:
     """The AUTHENTICATED user's id for this turn — the trust anchor for org scope.
 
     Read from the coroutine-isolated contextvar that Hermes sets server-side from
-    resolve_user(auth_token, ...); env fallback for the subprocess sandbox. NEVER a
+    resolve_user(auth_token, ...); never the process environment, which concurrent
+    requests share. NEVER a
     tool parameter and NEVER the request body — this is what lets us re-derive the
     org and reject a forged allow-list.
     """
@@ -126,7 +127,7 @@ def _get_user_id() -> Optional[str]:
             return uid
     except ImportError:
         pass
-    return os.environ.get("HERMES_USER_ID") or None
+    return None
 
 
 def _get_supabase():

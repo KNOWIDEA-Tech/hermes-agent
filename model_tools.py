@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import contextvars
 import json
 import asyncio
 import logging
@@ -109,7 +110,7 @@ def _run_async(coro):
         # Inside an async context (gateway, RL env) — run in a fresh thread.
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(asyncio.run, coro)
+            future = pool.submit(contextvars.copy_context().run, asyncio.run, coro)
             return future.result(timeout=300)
 
     # If we're on a worker thread (e.g., parallel tool execution in

@@ -88,3 +88,32 @@ def test_registered_passthrough_still_reaches_the_shell(monkeypatch):
     monkeypatch.setattr("tools.env_passthrough.is_env_passthrough", lambda name: name == "EXA_API_KEY")
     env = _sanitize_subprocess_env({"EXA_API_KEY": "exa", "SUPABASE_SERVICE_ROLE_KEY": "x"})
     assert env == {"EXA_API_KEY": "exa"}
+
+
+def test_sandbox_env_follows_the_request_onto_pool_threads():
+    """Parallel tool calls run on pool threads. With context propagation the
+    request's sandbox env goes with them; a fresh thread without it sees none
+    (never another request's)."""
+    import concurrent.futures
+    import contextvars
+
+    from tools.code_execution_tool import get_sandbox_env
+
+    set_sandbox_env({"HERMES_USER_ID": "request-a"})
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        propagated = pool.submit(contextvars.copy_context().run, get_sandbox_env).result()
+        bare = pool.submit(get_sandbox_env).result()
+    set_sandbox_env({})
+
+    assert propagated == {"HERMES_USER_ID": "request-a"}
+    assert bare == {}
+
+
+def test_note_tools_never_fall_back_to_the_process_environment(monkeypatch):
+    monkeypatch.setenv("HERMES_USER_ID", "another-request")
+    monkeypatch.setenv("HERMES_ACTIVE_PROJECT_ID", "another-project")
+    from tools import memory_consult_tool, user_notes_tool
+
+    assert user_notes_tool._get_user_id() is None
+    assert user_notes_tool._get_active_project_id() is None
+    assert memory_consult_tool._get_user_id() is None

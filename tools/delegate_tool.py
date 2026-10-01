@@ -16,6 +16,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import contextvars
 import json
 import logging
 logger = logging.getLogger(__name__)
@@ -508,6 +509,7 @@ def delegate_task(
         _i, _t, child = children[0]
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(
+                contextvars.copy_context().run,
                 _run_single_child, task_index=0, goal=_t["goal"],
                 child=child, parent_agent=parent_agent,
             )
@@ -535,6 +537,7 @@ def delegate_task(
             futures = {}
             for i, t, child in children:
                 future = executor.submit(
+                    contextvars.copy_context().run,
                     _run_single_child,
                     task_index=i,
                     goal=t["goal"],
