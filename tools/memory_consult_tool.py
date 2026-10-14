@@ -233,6 +233,78 @@ def _get_subagent_model() -> str:
 # Note fetch (allow-list bounded)
 # ---------------------------------------------------------------------------
 
+def _currently_readable_note_ids(
+    sb, note_ids: List[str], org_id: str, user_id: str
+) -> List[str]:
+    """Recheck the live membership, feature, and note grants before each fetch.
+
+    The web allow-list was correct when the chat started, but a share or feature
+    can be revoked while a long-running turn is still active. These reads use a
+    service-role client, so RLS cannot supply that second boundary for us.
+    Database errors fail closed rather than returning a stale allow-list.
+    """
+    if not note_ids or not org_id or not user_id:
+        return []
+    try:
+        membership_rows = (
+            sb.schema(_SCHEMA).table("memberships")
+            .select("id, organization_role")
+            .eq("user_id", user_id).eq("org_id", org_id).eq("status", "active")
+            .limit(1).execute().data or []
+        )
+        if not membership_rows:
+            return []
+        membership = membership_rows[0]
+        membership_id = membership.get("id")
+        if not membership_id:
+            return []
+        entitlements = (
+            sb.schema(_SCHEMA).table("organization_feature_entitlements")
+            .select("max_access_level")
+            .eq("org_id", org_id).eq("feature_key", "notes_context")
+            .limit(1).execute().data or []
+        )
+        access = (
+            sb.schema(_SCHEMA).table("membership_feature_access")
+            .select("access_level")
+            .eq("org_id", org_id).eq("membership_id", membership_id)
+            .eq("feature_key", "notes_context").limit(1).execute().data or []
+        )
+        readable_levels = {"view", "use", "manage"}
+        if (not entitlements or not access
+                or entitlements[0].get("max_access_level") not in readable_levels
+                or access[0].get("access_level") not in readable_levels):
+            return []
+
+        rows = (
+            sb.schema(_SCHEMA).table(_TABLE)
+            .select("id, user_id, context_node_id, is_user_context, is_agent_memory, is_workflow")
+            .in_("id", note_ids).eq("client_id", org_id).execute().data or []
+        )
+        own = {row["id"] for row in rows if row.get("user_id") == user_id}
+        others = {
+            row["id"] for row in rows
+            if row.get("user_id") != user_id and row.get("context_node_id")
+            and not row.get("is_user_context") and not row.get("is_agent_memory")
+            and not row.get("is_workflow")
+        }
+        if membership.get("organization_role") in {"owner", "admin"}:
+            readable = own | others
+        elif others:
+            grants = (
+                sb.schema(_SCHEMA).table("note_access_grants")
+                .select("note_id")
+                .eq("org_id", org_id).eq("grantee_membership_id", membership_id)
+                .in_("note_id", list(others)).execute().data or []
+            )
+            readable = own | {row["note_id"] for row in grants if row.get("note_id") in others}
+        else:
+            readable = own
+        return [note_id for note_id in note_ids if note_id in readable]
+    except Exception as exc:  # pragma: no cover - network/db dependent
+        logger.error("[consult_memory] live note access recheck failed", error=str(exc))
+        return []
+
 def _fetch_allowed_notes(
     sb, allowed_note_ids: List[str], org_id: str, user_id: str
 ) -> List[Dict[str, Any]]:
@@ -263,6 +335,9 @@ def _fetch_allowed_notes(
             cap=_MAX_NOTES,
         )
     if not ids or not org_id or not user_id:
+        return []
+    ids = _currently_readable_note_ids(sb, ids, org_id, user_id)
+    if not ids:
         return []
     result = (
         sb.schema(_SCHEMA)

@@ -21,6 +21,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools import memory_consult_tool as mct  # noqa: E402
+from tools import memory_read_tool as mrt  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +65,24 @@ class _FakeQuery:
 
 class _FakeSupabase:
     def __init__(self, tables):
-        self._tables = tables
+        # Most tests exercise scope rather than entitlement setup; give their
+        # home-org caller the normal live Notes access by default.
+        memberships = tables.get("memberships", [
+            {"id": "member-home", "user_id": USER_ID, "org_id": HOME_ORG,
+             "status": "active", "organization_role": "member"}
+        ])
+        self._tables = {
+            "memberships": memberships,
+            "organization_feature_entitlements": [
+                {"org_id": m["org_id"], "feature_key": "notes_context",
+                 "max_access_level": "manage"} for m in memberships
+            ],
+            "membership_feature_access": [
+                {"org_id": m["org_id"], "membership_id": m.get("id"),
+                 "feature_key": "notes_context", "access_level": "use"} for m in memberships
+            ],
+            **tables,
+        }
         self.queries = []
 
     def schema(self, _name):
@@ -82,6 +100,7 @@ USER_ID = "user-1"
 
 OWN_NOTE = {
     "id": "note-own",
+    "user_id": USER_ID,
     "path": "Team/Pricing",
     "description": "",
     "content": "Our Atlas pricing tier is $4,200/mo.",
@@ -91,6 +110,7 @@ OWN_NOTE = {
 }
 FOREIGN_NOTE = {
     "id": "note-foreign",
+    "user_id": "user-foreign",
     "path": "Team/Secrets",
     "description": "",
     "content": "COMPETITOR CONFIDENTIAL — margin is 62%.",
@@ -213,7 +233,8 @@ def test_uses_the_active_org_when_the_user_has_switched(llm_spy):
         {
             "users": _users(active_org_id=OTHER_ORG),
             "memberships": [
-                {"user_id": USER_ID, "org_id": OTHER_ORG, "status": "active"}
+                {"id": "member-other", "user_id": USER_ID, "org_id": OTHER_ORG,
+                 "status": "active", "organization_role": "member"}
             ],
             "user_notes": [OWN_NOTE, active_note],
         }
@@ -243,8 +264,46 @@ def test_stale_active_org_without_membership_falls_back_to_home_org(llm_spy):
     result = _run(sb, ["note-own", "note-foreign"])
 
     assert result["status"] == "ok"
-    assert "Atlas pricing tier" in llm_spy["prompt"]
-    assert "COMPETITOR CONFIDENTIAL" not in llm_spy["prompt"]
+    # Without *any* live membership, falling back to the home-org identifier
+    # must still not release even the user's formerly owned note.
+    assert "prompt" not in llm_spy
+
+
+def test_live_note_share_revocation_blocks_stale_allow_list():
+    colleague_note = dict(OWN_NOTE, id="note-colleague", user_id="colleague")
+    sb = _FakeSupabase({
+        "users": _users(), "user_notes": [colleague_note],
+        "note_access_grants": [{"note_id": "note-colleague", "org_id": HOME_ORG,
+                                "grantee_membership_id": "member-home"}],
+    })
+    assert mct._currently_readable_note_ids(
+        sb, ["note-colleague"], HOME_ORG, USER_ID) == ["note-colleague"]
+    sb._tables["note_access_grants"] = []
+    assert mct._currently_readable_note_ids(
+        sb, ["note-colleague"], HOME_ORG, USER_ID) == []
+    assert mrt._fetch_notes(
+        sb, ["note-colleague"], HOME_ORG, USER_ID, with_content=True
+    ) == []
+
+
+def test_live_note_feature_and_membership_revocation_block_owned_notes():
+    sb = _FakeSupabase({"users": _users(), "user_notes": [OWN_NOTE]})
+    assert mct._currently_readable_note_ids(sb, ["note-own"], HOME_ORG, USER_ID) == ["note-own"]
+    sb._tables["membership_feature_access"][0]["access_level"] = "off"
+    assert mct._currently_readable_note_ids(sb, ["note-own"], HOME_ORG, USER_ID) == []
+    sb._tables["membership_feature_access"][0]["access_level"] = "use"
+    sb._tables["memberships"][0]["status"] = "removed"
+    assert mct._currently_readable_note_ids(sb, ["note-own"], HOME_ORG, USER_ID) == []
+
+
+def test_owner_can_read_colleague_context_but_not_personal_overlay():
+    colleague_note = dict(OWN_NOTE, id="note-colleague", user_id="colleague")
+    personal_note = dict(colleague_note, id="note-personal", is_user_context=True)
+    sb = _FakeSupabase({"user_notes": [colleague_note, personal_note]})
+    sb._tables["memberships"][0]["organization_role"] = "owner"
+    assert mct._currently_readable_note_ids(
+        sb, ["note-colleague", "note-personal"], HOME_ORG, USER_ID
+    ) == ["note-colleague"]
 
 
 # ---------------------------------------------------------------------------

@@ -43,6 +43,7 @@ from tools.memory_consult_tool import (
     _get_supabase,
     _get_user_id,
     _resolve_user_org,
+    _currently_readable_note_ids,
     logger,
 )
 
@@ -107,6 +108,9 @@ def _fetch_notes(
     """
     ids = [str(i) for i in (note_ids or []) if i][:_MAX_IDS]
     if not ids or not org_id or not user_id:
+        return []
+    ids = _currently_readable_note_ids(sb, ids, org_id, user_id)
+    if not ids:
         return []
     cols = "id, path, description, internal_summary, context_node_id, is_user_context"
     if with_content:
