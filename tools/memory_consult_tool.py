@@ -256,7 +256,9 @@ def _currently_readable_note_ids(
             return []
         membership = membership_rows[0]
         membership_id = membership.get("id")
-        if not membership_id:
+        if not membership_id or membership.get("organization_role") not in {
+            "owner", "admin", "manager", "member"
+        }:
             return []
         entitlements = (
             sb.schema(_SCHEMA).table("organization_feature_entitlements")

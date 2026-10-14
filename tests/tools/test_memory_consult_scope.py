@@ -296,6 +296,12 @@ def test_live_note_feature_and_membership_revocation_block_owned_notes():
     assert mct._currently_readable_note_ids(sb, ["note-own"], HOME_ORG, USER_ID) == []
 
 
+def test_viewer_role_cap_blocks_notes_even_with_a_raw_feature_grant():
+    sb = _FakeSupabase({"user_notes": [OWN_NOTE]})
+    sb._tables["memberships"][0]["organization_role"] = "viewer"
+    assert mct._currently_readable_note_ids(sb, ["note-own"], HOME_ORG, USER_ID) == []
+
+
 def test_owner_can_read_colleague_context_but_not_personal_overlay():
     colleague_note = dict(OWN_NOTE, id="note-colleague", user_id="colleague")
     personal_note = dict(colleague_note, id="note-personal", is_user_context=True)
